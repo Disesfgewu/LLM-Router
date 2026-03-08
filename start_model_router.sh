@@ -1,9 +1,9 @@
 #!/bin/bash
 # ModelRouter API Gateway 啟動腳本
-# 多模型智能路由，自動在 GitHub/Google/Ollama 之間 failover
+# 多模型智慧路由，自動在 GitHub/Google/Ollama 之間 failover
 
 echo "╔════════════════════════════════════════════════════════════╗"
-echo "║       ModelRouter API Gateway - 多模型智能路由             ║"
+echo "║       ModelRouter API Gateway - 多模型智慧路由             ║"
 echo "╚════════════════════════════════════════════════════════════╝"
 echo ""
 

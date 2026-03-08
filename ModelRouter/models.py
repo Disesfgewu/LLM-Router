@@ -5,7 +5,7 @@ class models:
         self._config = {
             "TextOnlyLow" : {
                 "Google": {
-                    "gemma-3-27b" : {
+                    "gemma-3-12b-it" : {
                         "RPM": 30,
                         "TPM": 15000,
                         "RPD": 14400

@@ -30,7 +30,7 @@ PROVIDER_ORDER = ["GitHub", "Google", "Ollama"]  # 優先順序
 
 class ModelRouter:
     """
-    多模型智能路由器，自動在多個 LLM API 提供者之間做 failover 和配額管理。
+    多模型智慧路由器，自動在多個 LLM API 提供者之間做 failover 和配額管理。
     
     Features:
         - 多提供者路由 (GitHub Models, Google Gemini, Ollama)
@@ -49,6 +49,10 @@ class ModelRouter:
         self._github_client: Optional[OpenAI] = None
         self._ollama_client: Optional[OpenAI] = None
         
+        # 會話歷史記憶（保留最近的對話）
+        self.conversation_history: List[Dict[str, str]] = []
+        self.max_history_size: int = 10  # 最多保留10輪對話
+        
         # 模型配置：model_id → RPD 配額 (-1 表示無限制)
         # 順序決定優先級（同 provider 內先列的先試）
         self._config_limits: Dict[str, Any] = {
@@ -64,7 +68,7 @@ class ModelRouter:
             },
             "TextOnlyLow": {
                 "GitHub": {"openai/gpt-4o-mini": 150},
-                "Google": {"gemini-3.1-flash-lite": 500, "gemma-3-27b": 14400},
+                "Google": {"gemini-3.1-flash-lite": 500, "gemma-3-27b-it": 14400, "gemma-3-12b-it": 14400},
                 "Ollama": {"qwen3:4b-instruct": -1, "deepseek-r1:1.5b": -1}
             }
         }
@@ -401,4 +405,138 @@ class ModelRouter:
             raise
         except Exception as e:
             logger.critical(f"[Critical] Chat Error: {type(e).__name__}: {e}")
+            raise
+
+    # ─────────────────────────────────────────────────────────
+    # 記憶功能
+    # ─────────────────────────────────────────────────────────
+    def add_to_history(self, user_message: str, assistant_response: str) -> None:
+        """將對話添加到歷史記錄中。"""
+        with self._lock:
+            self.conversation_history.append({
+                "role": "user",
+                "content": user_message
+            })
+            self.conversation_history.append({
+                "role": "assistant", 
+                "content": assistant_response
+            })
+            
+            # 保持歷史記錄在限定大小內（每輪對話2條消息）
+            if len(self.conversation_history) > self.max_history_size * 2:
+                self.conversation_history = self.conversation_history[-(self.max_history_size * 2):]
+
+    def get_last_exchange(self) -> tuple[Optional[str], Optional[str]]:
+        """獲取最後一輪對話（問題和回答）。"""
+        with self._lock:
+            if len(self.conversation_history) >= 2:
+                last_user_msg = None
+                last_assistant_msg = None
+                
+                # 從後往前找
+                for msg in reversed(self.conversation_history):
+                    if msg["role"] == "assistant" and last_assistant_msg is None:
+                        last_assistant_msg = msg["content"]
+                    elif msg["role"] == "user" and last_user_msg is None:
+                        last_user_msg = msg["content"]
+                    
+                    if last_user_msg and last_assistant_msg:
+                        break
+                
+                return last_user_msg, last_assistant_msg
+            return None, None
+
+    def check_need_log_rag(self, user_message: str) -> bool:
+        """
+        Pre-chat: 使用 gemma-3-27b-it 判斷是否需要查詢 log 資訊。
+        
+        Args:
+            user_message: 用戶輸入的消息
+            
+        Returns:
+            True 表示需要查 log，False 表示不需要
+        """
+        # 關鍵字列表
+        memory_keywords = ["記憶", "memory", "查看過去", "剛剛", "之前", "先前", "上次", "log", "日誌", "歷史", "記錄"]
+        
+        # 簡單關鍵字匹配（大小寫不敏感）
+        user_message_lower = user_message.lower()
+        has_keyword = any(keyword.lower() in user_message_lower for keyword in memory_keywords)
+        
+        if not has_keyword:
+            logger.info(f"[Pre-chat] 未檢測到記憶相關關鍵字，跳過 RAG")
+            return False
+        
+        # 準備 prompt
+        prompt = f"""你是一個分類器。請判斷以下用戶問題是否需要查詢過去的系統日誌（app.log）來回答。
+
+用戶問題：{user_message}
+
+判斷標準：
+- 如果問題涉及查看過去的記錄、日誌、歷史、記憶、之前的對話等，回答 true
+- 如果問題是普通的對話或問答，不需要查詢歷史，回答 false
+
+請只回答 true 或 false，不要有其他內容。"""
+
+        # 使用 gemma-3-27b-it
+        model_id = "gemma-3-27b-it"
+        usage_key = f"TextOnlyLow|{model_id}"
+        
+        try:
+            # 檢查配額
+            remaining = self._get_remaining_quota(usage_key)
+            if remaining == 0:
+                logger.warning(f"[Pre-chat] {model_id} 配額已用完，使用關鍵字匹配")
+                return has_keyword
+            
+            # 調用模型
+            response = self.google.chat.completions.create(
+                model=model_id,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=10
+            )
+            
+            # 成功後扣減配額
+            self._decrement_quota(usage_key)
+            logger.info(f"[Pre-chat] {model_id} 調用成功，配額剩餘: {self._get_remaining_quota(usage_key)}")
+            
+            result = (response.choices[0].message.content or "").strip().lower()
+            logger.info(f"[Pre-chat] {model_id} 判斷結果: {result}")
+            
+            return "true" in result
+            
+        except RateLimitError as e:
+            logger.error(f"[Pre-chat] {model_id} 配額用完: {e}")
+            self._mark_quota_exhausted(usage_key)
+            return has_keyword
+                
+        except Exception as e:
+            logger.error(f"[Pre-chat] {model_id} 調用失敗: {e}，使用關鍵字匹配")
+            return has_keyword
+
+    def read_app_log(self, max_lines: int = 100) -> str:
+        """
+        讀取 app.log 的最後 N 行。
+        
+        Args:
+            max_lines: 最多讀取的行數
+            
+        Returns:
+            log 內容字符串
+        """
+        log_path = "app/app.log"
+        try:
+            if not os.path.exists(log_path):
+                return "[log 文件不存在]"
+            
+            with open(log_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+                # 取最後 max_lines 行
+                recent_lines = lines[-max_lines:] if len(lines) > max_lines else lines
+                return "".join(recent_lines)
+        except Exception as e:
+            logger.error(f"讀取 log 文件失敗: {e}")
+            return f"[讀取 log 失敗: {e}]"
+
             raise

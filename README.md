@@ -1,16 +1,18 @@
 # ModelRouter API Gateway
 
-多模型智能路由 API 閘道，對外提供 OpenAI 相容介面，自動在 GitHub Models、Google Gemini、Ollama 之間做 failover 和配額管理。
+多模型智慧路由 API 閘道，對外提供 OpenAI 相容介面，自動在 GitHub Models、Google Gemini、Ollama 之間做 failover 和配額管理。
 
 ## 功能特色
 
 ✅ **多提供者路由** - 自動在 GitHub Models、Google Gemini、Ollama 切換
 
-✅ **智能 Failover** - 一個模型失敗或額度滿，自動切換下一個
+✅ **智慧 Failover** - 一個模型失敗或額度滿，自動切換下一個
 
 ✅ **配額管理** - 本地追蹤每個模型的每日請求數 (RPD)
 
 ✅ **OpenAI 相容** - 完全相容 OpenAI API 格式
+
+✅ **智慧記憶功能** - Pre-chat 分析，自動查詢歷史日誌（使用 gemma-3-27b-it）⭐ NEW
 
 ✅ **Web UI** - React 前端儀錶板，實時查看配額和對話
 
@@ -35,10 +37,10 @@
 
 ![配額儀錶板](demo-png/demo-dash.PNG)
 
-#### 🔄 智能切換
+#### 🔄 智慧切換
 自動在不同 AI 提供者之間切換，確保服務持續可用。
 
-![智能切換](demo-png/demo-switch.PNG)
+![智慧切換](demo-png/demo-switch.PNG)
 
 #### 📝 日誌檢視器
 查看系統運行日誌和 API 呼叫記錄。
@@ -377,6 +379,106 @@ curl -X POST https://api.yourdomain.com/v1/chat/completions \
 - `TextOnlyHigh` - 只用高品質模型（GitHub gpt-4o, Gemini 2.5 flash）
 - `TextOnlyLow` - 只用經濟型模型（GitHub gpt-4o-mini, Gemini 3.1 flash-lite, Ollama 本地模型）
 - 具體模型名稱 - 如 `openai/gpt-4o`、`gemini-2.5-flash`
+
+## 🧠 智慧記憶功能 ⭐ NEW
+
+ModelRouter 現在支援智慧記憶功能，可以自動判斷是否需要查詢歷史日誌：
+
+### 功能特點
+
+- **Pre-chat 分析**：使用 gemma-3-27b-it 判斷用戶問題是否需要查詢歷史
+- **自動 RAG**：檢測到記憶相關關鍵字時，自動讀取 app.log 並增強 prompt
+- **配額追蹤**：gemma-3-27b-it 的使用會正確計入配額管理系統
+- **對話歷史**：自動保存最近 10 輪對話
+
+### 工作流程
+
+```
+用戶輸入
+    ↓
+檢查關鍵字
+    ↓
+Pre-chat 分析 (gemma-3-27b-it)
+    ├─ 檢查配額是否足夠 ⭐
+    ├─ 調用模型
+    └─ 成功後扣減配額 ⭐
+    ↓
+需要查 log？
+    ├─ 否 → 正常處理
+    └─ 是 → 讀取 app.log
+            ↓
+         增強 prompt
+            ↓
+         發送到主模型
+            ↓
+         返回結果
+            ↓
+         保存到對話歷史
+```
+
+### 觸發關鍵字
+
+當用戶問題包含以下關鍵字時，會觸發記憶查詢：
+
+**中文**：記憶、查看過去、剛剛、之前、先前、上次、日誌、歷史、記錄
+
+**英文**：memory、log、history
+
+### 使用範例
+
+```python
+# 一般對話（不觸發記憶）
+response = client.chat.completions.create(
+    model="auto",
+    messages=[{"role": "user", "content": "你好，介紹一下你自己"}]
+)
+
+# 查詢歷史（觸發記憶，會自動查詢 app.log）
+response = client.chat.completions.create(
+    model="auto",
+    messages=[{"role": "user", "content": "請查看剛剛的記錄"}]
+)
+```
+
+### 配額管理機制
+
+Pre-chat 分析採用**兩層配額管理機制**：
+
+**第一層：gemma-3-27b-it（主要）**
+- 使用 gemma-3-27b-it 模型進行智能判斷
+- 調用前檢查配額，確保配額足夠才調用
+- 調用成功後自動扣減配額（計數跳動）⭐
+- 配額設定：14400 RPD（每日請求數）
+
+**第二層：關鍵字匹配（備用）**
+- 如果 gemma-3-27b-it 配額用完，自動降級為關鍵字匹配
+- 完全本地處理，不依賴外部 API
+- 保證功能不會完全失效
+
+### 查看配額狀態
+
+```bash
+# 查看所有模型配額（包含 gemma-3-27b-it）
+curl http://localhost:8000/admin/status
+
+# 重置配額（每日一次）
+curl -X POST http://localhost:8000/admin/reset_quotas
+
+# 查看即時日誌
+tail -f app/app.log | grep -E '\[Pre-chat\]|\[Memory\]'
+```
+
+### 技術細節
+
+ModelRouter 新增的方法：
+
+- **`add_to_history(user_message, assistant_response)`** - 將對話添加到歷史記錄
+- **`check_need_log_rag(user_message)`** - Pre-chat 分析，自動管理配額
+- **`read_app_log(max_lines=100)`** - 讀取 app.log 的最後 N 行
+
+配置參數：
+- `max_history_size`: 最多保留的對話輪數（默認 10）
+- `max_lines`: 讀取 log 的最大行數（默認 100）
 
 ## 專案結構
 

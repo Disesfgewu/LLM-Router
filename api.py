@@ -3,7 +3,7 @@
 """
 ModelRouter API Gateway (OpenAI-compatible)
 
-多模型智能路由 API 閘道，對外提供 OpenAI 相容介面，
+多模型智慧路由 API 閘道，對外提供 OpenAI 相容介面，
 自動在 GitHub Models、Google Gemini、Ollama 之間做 failover 和配額管理。
 
 Endpoints:
@@ -257,6 +257,28 @@ async def chat_completions(request: ChatCompletionRequest):
         if request.max_tokens is not None:
             kwargs["max_tokens"] = request.max_tokens
         
+        # === Pre-chat: 檢查是否需要 RAG (記憶功能) ===
+        original_user_message = ""
+        if messages and messages[-1]["role"] == "user":
+            original_user_message = messages[-1]["content"]
+            
+            # 使用 gemma-3-12b-it 判斷是否需要查詢 log
+            need_log = router.check_need_log_rag(original_user_message)
+            
+            if need_log:
+                logger.info("[Memory] 檢測到需要查詢 log，正在載入...")
+                log_data = router.read_app_log(max_lines=100)
+                
+                # 修改 prompt，加入 log 資訊
+                enhanced_message = f"""這是過去的 log 資訊，請依據 log 的內容回答問題：
+
+{log_data}
+
+[問題]: {original_user_message}"""
+                
+                messages[-1]["content"] = enhanced_message
+                logger.info("[Memory] 已將 log 資訊注入到 prompt 中")
+        
         # 呼叫 router
         response = router.chat(
             messages=messages,
@@ -272,8 +294,13 @@ async def chat_completions(request: ChatCompletionRequest):
         if hasattr(response, 'model'):
             model_used = response.model
         
+        # === 將對話添加到歷史記錄 ===
+        if original_user_message and content:
+            router.add_to_history(original_user_message, content)
+            logger.info("[Memory] 已將對話添加到歷史記錄")
+        
         # 估算 tokens（簡單估算）
-        prompt_tokens = sum(len(m.content) // 4 for m in request.messages)
+        prompt_tokens = sum(len(m["content"]) // 4 for m in messages)
         completion_tokens = len(content) // 4
         
         return build_chat_response(
