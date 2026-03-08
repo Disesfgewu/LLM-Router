@@ -1,0 +1,85 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+logs/
+app/*.log
+
+# Node.js (Frontend)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+
+# Build output
+dist/
+dist-ssr/
+*.local
+
+# Database & Usage Tracking
+*.db
+*.sqlite
+*.sqlite3
+usage_tracker.json.bak
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+.cache/
+
+# OS specific
+Thumbs.db
+.DS_Store
+
+# Test files
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Ollama models (if stored locally)
+ollama_models/
+
+usage_tracker.json
