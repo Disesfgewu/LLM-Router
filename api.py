@@ -89,6 +89,8 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = False
     # 額外參數：指定類別
     target_category: Optional[str] = None
+    # 記憶功能控制：是否啟用記憶功能（default: True）
+    enable_memory: Optional[bool] = True
 
 
 class CompletionRequest(BaseModel):
@@ -262,22 +264,26 @@ async def chat_completions(request: ChatCompletionRequest):
         if messages and messages[-1]["role"] == "user":
             original_user_message = messages[-1]["content"]
             
-            # 使用 gemma-3-12b-it 判斷是否需要查詢 log
-            need_log = router.check_need_log_rag(original_user_message)
-            
-            if need_log:
-                logger.info("[Memory] 檢測到需要查詢 log，正在載入...")
-                log_data = router.read_app_log(max_lines=100)
+            # 只有在啟用記憶功能時才執行
+            if request.enable_memory:
+                # 使用 gemma-3-12b-it 判斷是否需要查詢 log
+                need_log = router.check_need_log_rag(original_user_message)
                 
-                # 修改 prompt，加入 log 資訊
-                enhanced_message = f"""這是過去的 log 資訊，請依據 log 的內容回答問題：
+                if need_log:
+                    logger.info("[Memory] 檢測到需要查詢 log，正在載入...")
+                    log_data = router.read_app_log(max_lines=100)
+                    
+                    # 修改 prompt，加入 log 資訊
+                    enhanced_message = f"""這是過去的 log 資訊，請依據 log 的內容回答問題：
 
 {log_data}
 
 [問題]: {original_user_message}"""
-                
-                messages[-1]["content"] = enhanced_message
-                logger.info("[Memory] 已將 log 資訊注入到 prompt 中")
+                    
+                    messages[-1]["content"] = enhanced_message
+                    logger.info("[Memory] 已將 log 資訊注入到 prompt 中")
+            else:
+                logger.info("[Memory] 記憶功能已停用，使用原始方法")
         
         # 呼叫 router
         response = router.chat(
@@ -295,7 +301,7 @@ async def chat_completions(request: ChatCompletionRequest):
             model_used = response.model
         
         # === 將對話添加到歷史記錄 ===
-        if original_user_message and content:
+        if request.enable_memory and original_user_message and content:
             router.add_to_history(original_user_message, content)
             logger.info("[Memory] 已將對話添加到歷史記錄")
         
