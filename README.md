@@ -5,10 +5,15 @@
 ## 功能特色
 
 ✅ **多提供者路由** - 自動在 GitHub Models、Google Gemini、Ollama 切換
+
 ✅ **智能 Failover** - 一個模型失敗或額度滿，自動切換下一個
+
 ✅ **配額管理** - 本地追蹤每個模型的每日請求數 (RPD)
+
 ✅ **OpenAI 相容** - 完全相容 OpenAI API 格式
+
 ✅ **Web UI** - React 前端儀錶板，實時查看配額和對話
+
 ✅ **自動文檔** - FastAPI 自動生成 API 文檔
 
 ## 📸 功能展示
