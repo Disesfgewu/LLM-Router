@@ -12,6 +12,14 @@
 
 ✅ **OpenAI 相容** - 完全相容 OpenAI API 格式
 
+✅ **OpenClaw / MCP 整合** - 支援 MCP transport、tool registry 與本地 `search_web` 工具
+
+✅ **Tool-Calling Shim** - 可判斷是否需要 web search，回傳 OpenAI 風格 `tool_calls`
+
+✅ **搜尋後合成回答** - 工具結果會重新進 LLM 做整理、分析與引用
+
+✅ **引用與來源回傳** - 搜尋型回答可附 `citations`，並要求輸出參考來源
+
 ✅ **智慧記憶功能** - Pre-chat 分析，自動查詢歷史日誌（使用 gemma-3-27b-it）⭐ NEW
 
 ✅ **Web UI** - React 前端儀錶板，實時查看配額和對話
@@ -61,14 +69,14 @@ GOOGLE_API_KEY=your_google_api_key
 GITHUB_MODELS_API_KEY=your_github_token
 
 # API 服務配置
-API_HOST=0.0.0.0
+API_HOST=127.0.0.1
 API_PORT=8000
 ```
 
 ### 2. 安裝依賴
 
 ```bash
-pip install fastapi uvicorn openai python-dotenv pydantic
+pip install -r requirements.txt
 ```
 
 ### 3. 啟動後端 API
@@ -78,7 +86,7 @@ python api.py
 ```
 
 服務將在以下地址啟動：
-- **API 服務**: http://0.0.0.0:8000
+- **API 服務**: http://127.0.0.1:8000
 - **API 文檔**: http://localhost:8000/docs
 - **健康檢查**: http://localhost:8000/health
 
@@ -92,25 +100,132 @@ python api.py
 
 詳細說明請參考 [FRONTEND_GUIDE.md](FRONTEND_GUIDE.md)
 
+## 文件導覽
+
+| 文件 | 說明 |
+|---|---|
+| [OPENCLAW_API_REPORT.md](OPENCLAW_API_REPORT.md) | 最新 API、物件、OpenClaw 與 MCP/tool 能力總覽 |
+| [API_USAGE_GUIDE.md](API_USAGE_GUIDE.md) | 一般 API 呼叫指南 |
+| [DIRECT_QUERY_EXAMPLES.md](DIRECT_QUERY_EXAMPLES.md) | `/v1/direct_query` 詳細範例 |
+| [DIRECT_QUERY_SUMMARY.md](DIRECT_QUERY_SUMMARY.md) | direct query 功能摘要 |
+| [FILE_UPLOAD_API.md](FILE_UPLOAD_API.md) | `/v1/file/generate_content` 使用方式 |
+
 ## API 端點
 
 ### 核心接口
 
 | 端點 | 方法 | 說明 |
 |------|------|------|
+| `/` | `GET`/`POST` | 服務資訊與端點摘要 |
+| `/health` | `GET`/`POST` | 健康檢查 |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API |
 | `/v1/completions` | POST | OpenAI Completions API (legacy) |
+| `/v1/direct_query` | POST | 直接查詢指定 provider/model |
+| `/v1/file/generate_content` | POST | 上傳圖片或文件並生成內容 |
 | `/v1/models` | GET/POST | 列出所有可用模型 |
-| `/health` | GET/POST | 健康檢查 |
-| `/` | GET/POST | 服務資訊 |
 
 ### 管理接口
 
 | 端點 | 方法 | 說明 |
 |------|------|------|
 | `/admin/status` | GET | 查看配額狀態 |
+| `/admin/logs` | GET | 讀取最新日誌 |
 | `/admin/reset_quotas` | POST | 重置所有配額 (每日) |
 | `/admin/refresh_rpm` | POST | 重置優先順序指標 |
+
+### OpenClaw / MCP 接口
+
+| 端點 | 方法 | 說明 |
+|------|------|------|
+| `/mcp/sse` | GET | OpenClaw MCP SSE transport |
+| `/mcp/messages` | POST | OpenClaw MCP JSON-RPC message channel |
+
+## OpenClaw 支援重點
+
+### 相容能力
+
+- 支援 OpenAI-style `tools` 與 `tool_choice` 請求欄位
+- 可辨識 web-search-like tool 宣告並輸出 `tool_calls`
+- 支援 OpenClaw 內建 `web_search` 導向本地搜尋工具
+- 支援 post-tool round 將搜尋結果重新送回 LLM 合成答案
+- 支援在搜尋回應中附加 `citations`
+- 支援 chat completions 串流與串流 tool-call 輸出
+
+### Tool-Calling 流程
+
+1. 使用者訊息送到 `/v1/chat/completions`
+2. 如果宣告了 web search 工具，gateway 先判斷是否真的需要搜尋
+3. 若需要，先回 `tool_calls`
+4. client 執行工具或由 OpenClaw 走 MCP round trip
+5. 工具結果回到 `/v1/chat/completions`
+6. gateway 萃取來源、清理工具輸出，再交給模型做最終回答
+
+## Tool API List
+
+目前 MCP server 註冊的工具如下。
+
+### `search_web`
+
+用途：搜尋即時網路資訊，供 OpenClaw / MCP client 或 chat tool-calling round 使用。
+
+輸入物件：
+
+```json
+{
+  "query": "台指期 昨日收盤",
+  "max_results": 5
+}
+```
+
+輸入欄位：
+
+| 欄位 | 類型 | 必填 | 說明 |
+|---|---|---|---|
+| `query` | string | 是 | 搜尋關鍵字 |
+| `max_results` | integer | 否 | 最多回傳結果數，預設 `5` |
+
+輸出內容：
+
+- MCP text content list
+- 每筆結果包含標題、URL、Snippet
+- 部分資料型查詢會額外附 `Detail`
+
+## 支援的主要請求物件
+
+### Chat Completion Request
+
+`/v1/chat/completions` 目前實際支援的主要欄位：
+
+| 欄位 | 類型 | 說明 |
+|---|---|---|
+| `model` | string | `auto`、分類名或具體模型名 |
+| `messages` | array | OpenAI-style message list |
+| `temperature` | number | 生成溫度 |
+| `max_tokens` | integer | 回答長度上限 |
+| `max_completion_tokens` | integer | `max_tokens` 替代欄位 |
+| `stream` | boolean | 支援 SSE 串流 |
+| `target_category` | string | 指定路由類別 |
+| `enable_memory` | boolean | 啟用或停用記憶注入 |
+| `tools` | array | OpenAI-style tool definitions |
+| `tool_choice` | string/object | 控制工具策略 |
+
+### Message Object
+
+支援的 message role 與正規化規則：
+
+- `user`
+- `assistant`
+- `system`
+- `developer` 會被正規化成 `system`
+- `tool` 會被轉成 system transcript 再交給 router
+
+### 內容型別
+
+`content` 可接受：
+
+- 純字串
+- OpenAI-style part list
+- 含 `text` 或 `content` 的 object
 
 ## 使用範例
 
@@ -369,7 +484,7 @@ curl -X POST https://api.yourdomain.com/v1/chat/completions \
 | `frequency_penalty` | float | 否 | 頻率懲罰 (-2.0-2.0)，預設 0.0 |
 | `presence_penalty` | float | 否 | 存在懲罰 (-2.0-2.0)，預設 0.0 |
 | `stop` | string/array | 否 | 停止序列 |
-| `stream` | boolean | 否 | 是否串流回應（目前不支援） |
+| `stream` | boolean | 否 | `/v1/chat/completions` 支援 SSE；`/v1/completions` 不支援 |
 
 ## 🎯 模型選擇
 
