@@ -275,6 +275,7 @@ from app.messages import (
     prune_messages,
     _estimate_messages_tokens,
 )
+from app.multimodal import prepare_multimodal_messages
 from app.tools import (
     _is_openclaw_web_search,
     _extract_last_user_query,
@@ -341,7 +342,7 @@ async def list_models():
     for cat, providers in router._config_limits.items():
         for provider, models_dict in providers.items():
             for model_id, rpd in models_dict.items():
-                usage_key = f"{cat}|{model_id}"
+                usage_key = router.get_usage_key(provider, model_id)
                 remaining = router._local_remaining_rpd.get(usage_key, rpd)
                 models.append({
                     "id": model_id,
@@ -424,6 +425,24 @@ async def chat_completions(request: Request):
         raise HTTPException(status_code=400, detail="messages must not be empty")
 
     router = get_router()
+
+    try:
+        raw_messages, multimodal_profile = prepare_multimodal_messages(raw_messages)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("[Multimodal] preprocess failed")
+        raise HTTPException(status_code=400, detail=f"multimodal preprocess failed: {exc}")
+
+    if multimodal_profile.get("has_multimodal_input"):
+        enable_memory = False
+        logger.info("[Multimodal] attachments detected; memory injection disabled")
+
+    if target_category is None:
+        decided_category = router.decide_multimodal_category(raw_messages, multimodal_profile)
+        if decided_category:
+            target_category = decided_category
+            logger.info("[Multimodal] target_category auto-selected: %s", decided_category)
 
     # tool-calling shim：若宣告了 web_search tool，先回 tool_calls 讓 OpenClaw 觸發工具。
     raw_tools = raw.get("tools", [])
@@ -656,7 +675,11 @@ async def chat_completions(request: Request):
         enable_memory = False  # tool request 不注入 log memory
         logger.info("[Tools] has_tools=True, memory disabled, pruning aggressively")
 
-    messages = normalize_messages(raw_messages)
+    preserve_multimodal = bool(
+        target_category == "MultiModal" and
+        multimodal_profile.get("has_image_input")
+    )
+    messages = normalize_messages(raw_messages, preserve_multimodal=preserve_multimodal)
 
     if not messages:
         raise HTTPException(status_code=400, detail="no usable messages after normalization")
@@ -691,6 +714,8 @@ async def chat_completions(request: Request):
         target_category = "TextOnlyHigh"
     elif model_name in ["chatonly", "chat", "reasoning"]:
         target_category = "ChatOnly"
+    elif model_name in ["multimodal", "vision", "ocr"]:
+        target_category = "MultiModal"
     elif model_name in ["textonlylow", "low"]:
         target_category = "TextOnlyLow"
     elif model_name != "auto":
@@ -896,7 +921,7 @@ async def admin_status():
         for provider, models_dict in providers.items():
             status["quotas"][cat][provider] = {}
             for model_id, rpd_limit in models_dict.items():
-                usage_key = f"{cat}|{model_id}"
+                usage_key = router.get_usage_key(provider, model_id)
                 remaining = router._local_remaining_rpd.get(usage_key, rpd_limit)
                 status["quotas"][cat][provider][model_id] = {
                     "limit": rpd_limit,

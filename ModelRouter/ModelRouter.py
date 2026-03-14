@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import json
 import logging
@@ -26,6 +27,14 @@ DEFAULT_TIMEOUT = 60          # API 請求 timeout (秒)
 MAX_RETRIES = 2               # 網路錯誤最大重試次數
 RETRY_DELAY = 1.0             # 重試間隔 (秒)
 PROVIDER_ORDER = ["GitHub", "Google", "Ollama"]  # 優先順序
+MULTIMODAL_INTENT_RE = re.compile(
+    r"(ocr|圖片|图像|影像|照片|截圖|截图|掃描|扫描|看圖|看图|image|vision|visual|pdf|csv|xlsx|excel|文件|檔案|document)",
+    re.IGNORECASE,
+)
+IMAGE_GENERATION_INTENT_RE = re.compile(
+    r"(生成圖片|生成图像|生圖|生图|畫圖|画图|image\s*generation|generate\s+image|draw\s+an\s+image|imagen)",
+    re.IGNORECASE,
+)
 
 
 class ModelRouter:
@@ -48,6 +57,43 @@ class ModelRouter:
         self._google_client: Optional[OpenAI] = None
         self._github_client: Optional[OpenAI] = None
         self._ollama_client: Optional[OpenAI] = None
+
+        self._model_capabilities: Dict[str, Dict[str, Any]] = {
+            "gemini-2.5-flash": {
+                "chat_capable": True,
+                "image_input": True,
+                "document_input": True,
+                "preferred_tasks": ["ocr", "vision", "multimodal_analysis"],
+            },
+            "gemini-2.5-flash-lite": {
+                "chat_capable": True,
+                "image_input": True,
+                "document_input": False,
+                "preferred_tasks": ["vision"],
+            },
+            "gemma-3-27b-it": {
+                "chat_capable": True,
+                "image_input": True,
+                "document_input": False,
+                "preferred_tasks": ["ocr", "vision", "multimodal_analysis"],
+            },
+            "gemini-2.5-flash-tts": {
+                "chat_capable": False,
+                "task": "tts",
+            },
+            "imagen-4-generate": {
+                "chat_capable": False,
+                "task": "image_generation",
+            },
+            "imagen-4-ultra-generate": {
+                "chat_capable": False,
+                "task": "image_generation",
+            },
+            "imagen-4-fast-generate": {
+                "chat_capable": False,
+                "task": "image_generation",
+            },
+        }
         
         # 會話歷史記憶（保留最近的對話）
         self.conversation_history: List[Dict[str, str]] = []
@@ -79,6 +125,12 @@ class ModelRouter:
                 "GitHub": {"openai/gpt-4o-mini": 150},
                 "Google": {"gemini-3.1-flash-lite-preview": 500, "gemma-3-27b-it": 14400},
                 "Ollama": {"qwen3:4b-instruct": -1, "deepseek-r1:1.5b": -1}
+            },
+            "MultiModal": {
+                "Google": {
+                    "gemini-2.5-flash": 20,
+                    "gemma-3-27b-it": 14400,
+                }
             }
         }
         
@@ -92,6 +144,9 @@ class ModelRouter:
         self._load_usage_db()
         self._build_priority_map()
         logger.info("🚀 ModelRouter 初始化完成。")
+
+    def get_usage_key(self, provider: str, model_id: str) -> str:
+        return f"{provider}|{model_id}"
 
     # ─────────────────────────────────────────────────────────
     # 配額管理
@@ -116,7 +171,7 @@ class ModelRouter:
         for cat, providers in self._config_limits.items():
             for provider, models_dict in providers.items():
                 for model_id, rpd_value in models_dict.items():
-                    key = f"{cat}|{model_id}"
+                    key = self.get_usage_key(provider, model_id)
                     if key not in self._local_remaining_rpd:
                         self._local_remaining_rpd[key] = rpd_value
                         updated = True
@@ -157,7 +212,7 @@ class ModelRouter:
                 for provider, models_dict in providers.items():
                     for model_id, rpd_value in models_dict.items():
                         # rpd_value 直接是數字 (-1 表示無限制)
-                        self._local_remaining_rpd[f"{cat}|{model_id}"] = rpd_value
+                        self._local_remaining_rpd[self.get_usage_key(provider, model_id)] = rpd_value
             
             # 重置所有類別的優先順序指標
             self.priority_flags = {cat: 0 for cat in self._config_limits.keys()}
@@ -237,6 +292,109 @@ class ModelRouter:
         with self._lock:
             self.priority_flags[category] = index
 
+    def _flatten_content_for_log(self, content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: List[str] = []
+            for part in content:
+                if isinstance(part, dict):
+                    if part.get("type") == "image_url":
+                        parts.append("[image]")
+                        continue
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+                        continue
+                elif isinstance(part, str):
+                    parts.append(part)
+            return "\n".join(parts)
+        return str(content)
+
+    def _extract_json_object(self, text: str) -> Optional[Dict[str, Any]]:
+        stripped = (text or "").strip()
+        if not stripped:
+            return None
+        candidates = [stripped]
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidates.append(stripped[start:end + 1])
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+            except Exception:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+        return None
+
+    def decide_multimodal_category(
+        self,
+        raw_messages: List[Dict[str, Any]],
+        request_profile: Dict[str, Any],
+    ) -> Optional[str]:
+        """Use a cheap model once to decide whether expensive multimodal routing is needed."""
+        latest_user_text = str(request_profile.get("latest_user_text", ""))
+        has_image_input = bool(request_profile.get("has_image_input"))
+        has_file_input = bool(request_profile.get("has_file_input"))
+        file_kinds = request_profile.get("file_kinds", [])
+
+        if IMAGE_GENERATION_INTENT_RE.search(latest_user_text):
+            logger.info("[MultimodalDecision] image generation intent detected, but chat endpoint stays text-oriented; skip MultiModal chat routing")
+            return None
+
+        if not has_image_input and not has_file_input and not MULTIMODAL_INTENT_RE.search(latest_user_text):
+            return None
+
+        heuristic_default = has_image_input
+        decision_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是多模態路由分類器。"
+                    "請判斷當前請求是否必須使用昂貴的多模態聊天模型。"
+                    "只有在真的需要理解圖片、OCR、截圖內容、掃描檔內容時才 use_multimodal=true。"
+                    "如果只是 txt/csv/xlsx/pdf 被系統預先轉成文字摘要，通常 use_multimodal=false。"
+                    "如果是 image generation 或 TTS 類需求，目前 chat endpoint 不直接走該類模型，請 use_multimodal=false。"
+                    "只能輸出單一 JSON 物件。"
+                    '{"use_multimodal": true|false, "task": "text_only|ocr|vision|document_analysis|image_generation|tts", "reason": "..."}'
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"latest_user_text: {latest_user_text or '(empty)'}\n"
+                    f"has_image_input: {has_image_input}\n"
+                    f"has_file_input: {has_file_input}\n"
+                    f"file_kinds: {file_kinds}\n"
+                ),
+            },
+        ]
+
+        try:
+            response = self._execute_chat(
+                "TextOnlyLow",
+                decision_messages,
+                temperature=0.0,
+                max_tokens=160,
+            )
+            if response and response.choices and response.choices[0].message:
+                content = response.choices[0].message.content or ""
+                parsed = self._extract_json_object(content)
+                if parsed and parsed.get("use_multimodal") is True:
+                    task = str(parsed.get("task", ""))
+                    if task == "image_generation":
+                        logger.info("[MultimodalDecision] classifier detected image generation, skip MultiModal chat routing")
+                        return None
+                    logger.info("[MultimodalDecision] use_multimodal=True task=%s", task)
+                    return "MultiModal"
+                logger.info("[MultimodalDecision] classifier returned text-only")
+        except Exception as exc:
+            logger.warning("[MultimodalDecision] classifier failed, fallback to heuristics: %s", exc)
+
+        return "MultiModal" if heuristic_default else None
+
     def _prepare_kwargs(self, model_id: str, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         """
         根據模型調整參數。某些模型有特殊的參數限制。
@@ -307,7 +465,7 @@ class ModelRouter:
         self,
         client: OpenAI,
         model_id: str,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         **kwargs
     ) -> Any:
         """
@@ -361,7 +519,7 @@ class ModelRouter:
     def _execute_chat(
         self,
         category: str,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         **kwargs
     ) -> Optional[Any]:
         """
@@ -425,7 +583,7 @@ class ModelRouter:
         model_list: List[Dict[str, str]],
         category: str,
         start_idx: int,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         is_ollama_phase: bool = False,
         **kwargs
     ) -> Optional[Any]:
@@ -449,7 +607,7 @@ class ModelRouter:
             m = model_list[i]
             model_id = m["model_id"]
             provider = m["provider"]
-            usage_key = f"{category}|{model_id}"
+            usage_key = self.get_usage_key(provider, model_id)
             attempted_count += 1
             
             # 檢查配額
@@ -462,7 +620,8 @@ class ModelRouter:
                 
                 # Log: 嘗試路由
                 user_query = messages[-1].get('content', '') if messages else ""
-                query_preview = user_query[:50] + "..." if len(user_query) > 50 else user_query
+                flattened_query = self._flatten_content_for_log(user_query)
+                query_preview = flattened_query[:50] + "..." if len(flattened_query) > 50 else flattened_query
                 logger.info(f"[Route Try] Cat: {category} | Model: {model_id} | Query: {query_preview}")
                 
                 # 執行呼叫（帶重試）
@@ -554,7 +713,7 @@ class ModelRouter:
     # ─────────────────────────────────────────────────────────
     def chat(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         mode: str = "auto",
         target_category: Optional[str] = None,
         include_chat_only: bool = False,
@@ -567,7 +726,7 @@ class ModelRouter:
         Args:
             messages: OpenAI 格式的訊息列表
             mode: 路由模式（目前僅支援 "auto"）
-            target_category: 指定類別，如 "TextOnlyHigh"、"TextOnlyLow"、"ChatOnly"
+            target_category: 指定類別，如 "TextOnlyHigh"、"TextOnlyLow"、"ChatOnly"、"MultiModal"
             include_chat_only: auto 模式是否包含 ChatOnly 推理模型（僅對 chat completions）
             reverse_order: auto 模式是否反轉順序（Low→High，用於 legacy completions）
             **kwargs: 傳遞給 OpenAI API 的其他參數
@@ -607,7 +766,7 @@ class ModelRouter:
                     res = self._execute_chat("ChatOnly", messages, **kwargs)
                     if res:
                         return res
-                
+
                 res = self._execute_chat("TextOnlyLow", messages, **kwargs)
                 if res:
                     return res
@@ -693,7 +852,7 @@ class ModelRouter:
 
         # 使用 gemma-3-27b-it
         model_id = "gemma-3-27b-it"
-        usage_key = f"TextOnlyLow|{model_id}"
+        usage_key = self.get_usage_key("Google", model_id)
         
         try:
             # 檢查配額

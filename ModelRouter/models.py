@@ -94,6 +94,16 @@ class models:
             },
             "MultiModal" : {
                 "Google": {
+                    "gemini-2.5-flash" : {
+                        "RPM": 5,
+                        "TPM": 250000,
+                        "RPD": 20
+                    },
+                    "gemma-3-27b-it" : {
+                        "RPM": 30,
+                        "TPM": 15000,
+                        "RPD": 14400
+                    },
                     "gemini-2.5-flash-tts" : {
                         "RPM": 3,
                         "TPM": 10000,
