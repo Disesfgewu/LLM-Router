@@ -17,6 +17,120 @@ MAX_MULTIMODAL_FILES = 5
 MAX_TEXT_EXTRACT_CHARS = 12000
 
 
+def _ensure_content_parts(content: Any) -> List[Dict[str, Any]]:
+    if isinstance(content, list):
+        normalized: List[Dict[str, Any]] = []
+        for part in content:
+            if isinstance(part, dict):
+                normalized.append(part)
+            elif isinstance(part, str):
+                normalized.append({"type": "text", "text": part})
+        return normalized
+    if isinstance(content, str) and content.strip():
+        return [{"type": "text", "text": content}]
+    return []
+
+
+def inject_payload_attachments(raw_messages: List[Any], payload: Dict[str, Any]) -> List[Any]:
+    """Merge top-level payload attachments into the latest user message.
+
+    Supported payload fields:
+    - attachments: list[part-like object]
+    - input_files: list[{file_name, mime_type, file_data}]
+    - input_images: list[str|{url:str}|{image_url:{url:str}}]
+    """
+    merged_messages = [m if isinstance(m, dict) else m for m in raw_messages]
+
+    attachment_parts: List[Dict[str, Any]] = []
+
+    attachments = payload.get("attachments", [])
+    if isinstance(attachments, list):
+        for item in attachments:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type in {"text", "input_text"}:
+                text = item.get("text") or item.get("input_text")
+                if isinstance(text, str) and text.strip():
+                    attachment_parts.append({"type": "text", "text": text})
+                continue
+            if item_type == "image_url":
+                image_url = item.get("image_url")
+                if isinstance(image_url, dict) and isinstance(image_url.get("url"), str):
+                    attachment_parts.append({"type": "image_url", "image_url": {"url": image_url["url"]}})
+                elif isinstance(item.get("url"), str):
+                    attachment_parts.append({"type": "image_url", "image_url": {"url": item["url"]}})
+                continue
+            if item_type == "input_file":
+                file_data = item.get("file_data") or item.get("data")
+                if isinstance(file_data, str) and file_data.strip():
+                    attachment_parts.append(
+                        {
+                            "type": "input_file",
+                            "file_name": item.get("file_name") or item.get("filename") or "",
+                            "mime_type": item.get("mime_type") or item.get("content_type") or "",
+                            "file_data": file_data,
+                        }
+                    )
+
+    input_files = payload.get("input_files", [])
+    if isinstance(input_files, list):
+        for file_item in input_files:
+            if not isinstance(file_item, dict):
+                continue
+            file_data = file_item.get("file_data") or file_item.get("data")
+            if not isinstance(file_data, str) or not file_data.strip():
+                continue
+            attachment_parts.append(
+                {
+                    "type": "input_file",
+                    "file_name": file_item.get("file_name") or file_item.get("filename") or "",
+                    "mime_type": file_item.get("mime_type") or file_item.get("content_type") or "",
+                    "file_data": file_data,
+                }
+            )
+
+    input_images = payload.get("input_images", [])
+    if isinstance(input_images, list):
+        for image_item in input_images:
+            if isinstance(image_item, str) and image_item.strip():
+                attachment_parts.append({"type": "image_url", "image_url": {"url": image_item}})
+                continue
+            if not isinstance(image_item, dict):
+                continue
+            image_url = image_item.get("image_url")
+            if isinstance(image_url, dict) and isinstance(image_url.get("url"), str):
+                attachment_parts.append({"type": "image_url", "image_url": {"url": image_url["url"]}})
+                continue
+            if isinstance(image_item.get("url"), str):
+                attachment_parts.append({"type": "image_url", "image_url": {"url": image_item["url"]}})
+
+    if not attachment_parts:
+        return merged_messages
+
+    user_index = -1
+    for idx in range(len(merged_messages) - 1, -1, -1):
+        candidate = merged_messages[idx]
+        if isinstance(candidate, dict) and candidate.get("role") == "user":
+            user_index = idx
+            break
+
+    if user_index == -1:
+        merged_messages.append({"role": "user", "content": attachment_parts})
+        return merged_messages
+
+    last_user = merged_messages[user_index]
+    if not isinstance(last_user, dict):
+        return merged_messages
+
+    existing_parts = _ensure_content_parts(last_user.get("content", ""))
+    existing_parts.extend(attachment_parts)
+    cloned = dict(last_user)
+    cloned["content"] = existing_parts
+    merged_messages[user_index] = cloned
+    return merged_messages
+
+
 def _get_latest_user_text(raw_messages: List[Any]) -> str:
     for message in reversed(raw_messages):
         if not isinstance(message, dict) or message.get("role") != "user":

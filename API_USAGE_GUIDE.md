@@ -1,10 +1,73 @@
 # API 使用指南
 
-本文檔說明如何從其他程式碼中調用 ModelRouter API 的兩個主要端點。
+本文檔說明如何從其他程式碼中調用 ModelRouter API 的主要端點，並補充今天新增的研究型搜尋、生圖與程式碼輸出增強行為。
+
+## 今日更新摘要
+
+- `/v1/chat/completions` 會先經過 Gemma 統一意圖分類，再決定文字、多模態、記憶或生圖路徑
+- 搜尋型問題支援多步規劃搜尋與 reviewer 補查回圈
+- 程式碼任務會強制要求完整可執行程式、`main()`、至少 2 組測資、複雜度與邊界條件
+- 資料驅動圖片需求可先查資料再進入 image generation
+- `/admin/status` 現在也會回傳內部 Gemma helper 用量
 
 ## 目錄
+- [0. `/v1/chat/completions` - 研究型與多模態聊天](#0-v1chatcompletions---研究型與多模態聊天)
 - [1. `/v1/completions` - OpenAI Completions API (舊版)](#1-v1completions---openai-completions-api-舊版)
 - [2. `/v1/direct_query` - 直接查詢指定模型](#2-v1direct_query---直接查詢指定模型)
+- [3. `/v1/images/generations` - OpenAI Images API](#3-v1imagesgenerations---openai-images-api)
+
+---
+
+## 0. `/v1/chat/completions` - 研究型與多模態聊天
+
+### 端點資訊
+- **URL**: `http://localhost:8000/v1/chat/completions`
+- **方法**: `POST`
+- **Content-Type**: `application/json`
+
+### 新增行為重點
+
+- 所有請求會先走 Gemma 意圖分類
+- 複雜問題可自動進入 `需求拆解 -> 多次搜尋 -> 彙整 -> reviewer 檢查 -> 補查` 流程
+- 程式碼問題會偏向輸出完整實作，而不是只給概念摘要
+- 同一個端點可直接接收圖片與文件附件
+- 若判定為圖片生成需求，可自動改走生圖路徑
+
+### 常用欄位
+
+```json
+{
+    "model": "auto",
+    "messages": [{"role": "user", "content": "幫我整理最近一週台積電股價走勢"}],
+    "temperature": 0.7,
+    "max_tokens": 2048,
+    "stream": false,
+    "tools": [],
+    "tool_choice": "auto",
+    "enable_memory": true,
+    "input_files": [],
+    "input_images": [],
+    "enable_auto_image_generation": true,
+    "image_model": "black-forest-labs/FLUX.1-schnell",
+    "image_n": 1,
+    "image_size": "1024x1024"
+}
+```
+
+### 搜尋型回答補充
+
+- 若回答使用了外部資料，可能回傳 `citations`
+- 若 reviewer 判定第一版答案不完整，後端可能自動補做 follow-up 搜尋
+- 若是資料型圖片需求，回應也可能帶有 `research_tasks`
+
+### 程式碼任務補充
+
+目前後端會盡量要求模型遵守以下最低標準：
+
+- 提供完整可編譯/可執行程式
+- 包含 `main()`
+- 至少 2 組測資
+- 說明時間複雜度、空間複雜度與邊界條件
 
 ---
 
@@ -216,9 +279,38 @@ curl -X POST "http://localhost:8000/v1/completions" \
   - `"GitHub"` - GitHub Models
   - `"Google"` - Google Gemini
   - `"Ollama"` - 本地 Ollama
+    - `"HuggingFace"` - HuggingFace provider
 - `prompt`: 提示詞文本（必填）
 - `temperature`: 溫度參數（可選）
 - `max_tokens`: 最大生成 token 數（可選）
+
+---
+
+## 3. `/v1/images/generations` - OpenAI Images API
+
+### 端點資訊
+- **URL**: `http://localhost:8000/v1/images/generations`
+- **方法**: `POST`
+- **Content-Type**: `application/json`
+
+### 請求格式
+
+```json
+{
+    "model": "black-forest-labs/FLUX.1-schnell",
+    "prompt": "幫我生成一張台北夜景海報",
+    "n": 1,
+    "size": "1024x1024",
+    "response_format": "b64_json"
+}
+```
+
+### 補充說明
+
+- chat 端點內也能自動判斷是否要切到 image generation
+- 若屬於 K 線圖、趨勢圖、dashboard 之類資料驅動圖像，後端會先查資料再生成
+- 支援的 `response_format`：`b64_json`、`url`
+- 目前預設 image model 為 `black-forest-labs/FLUX.1-schnell`
 
 ### 使用範例
 

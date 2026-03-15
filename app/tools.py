@@ -407,3 +407,286 @@ def _llm_decide_web_search(
     except Exception:
         logger.exception("[ToolShim] LLM decision call failed")
         return None, "", []
+
+
+def _llm_plan_web_search_tasks(
+    router: Any,
+    raw_messages: List[Any],
+    query: str,
+) -> List[Dict[str, Any]]:
+    """Plan multi-step web searches: derive required information slots then map each to a query."""
+    clean_query = _sanitize_search_query(query)
+    if not clean_query:
+        return []
+
+    transcript = normalize_messages(raw_messages)
+    transcript = prune_messages(
+        transcript,
+        max_input_tokens=2200,
+        keep_last=8,
+        max_chars_per_message=1200,
+    )
+    transcript_text = "\n".join(
+        f"{m.get('role', 'user')}: {m.get('content', '')}" for m in transcript
+    )
+
+    planner_instruction = (
+        "你是資訊蒐集規劃器。請先拆解『回答問題前必須取得的資訊』，"
+        "再為每個資訊需求產生一條最適合的 web_search 查詢。"
+        "只輸出單一 JSON 物件，不要輸出任何其他文字。"
+        "JSON 格式："
+        '{"tasks": [{"need": "資訊需求", "query": "搜尋關鍵字", "why": "用途", "priority": 1}]}'
+        "規則："
+        "tasks 至多 4 筆；priority 由小到大表示優先順序；"
+        "query 要可直接拿去搜尋；need 與 why 要簡潔可讀。"
+    )
+    planner_context = (
+        f"最近對話：\n{transcript_text}\n\n"
+        f"最新使用者問題：{clean_query}\n\n"
+        "請回傳 JSON。"
+    )
+    decision_messages = [
+        {
+            "role": "system",
+            "content": planner_instruction,
+        },
+        {
+            "role": "user",
+            "content": planner_context,
+        },
+    ]
+
+    fallback = [
+        {
+            "need": "回答問題所需的核心外部資訊",
+            "query": clean_query,
+            "why": "fallback",
+            "priority": 1,
+        }
+    ]
+
+    try:
+        # Prefer Gemma-3-27B explicitly for planning; fallback to TextOnlyHigh pool.
+        content = ""
+        try:
+            model_id = "gemma-3-27b-it"
+            accounts = []
+            if hasattr(router, "_get_provider_accounts"):
+                accounts = router._get_provider_accounts("Google")
+
+            for account in accounts:
+                account_id = account.get("id", "default")
+                usage_key = router.get_usage_key("Google", model_id, account_id)
+                if router._get_remaining_quota(usage_key) == 0:
+                    continue
+
+                client = router._get_client("Google", account_id)
+                if hasattr(router, "record_internal_usage"):
+                    router.record_internal_usage("gemma_search_planner_calls")
+                gemma_user_prompt = f"{planner_instruction}\n\n{planner_context}"
+                response = client.chat.completions.create(
+                    model=model_id,
+                    messages=[{"role": "user", "content": gemma_user_prompt}],
+                    temperature=0.0,
+                    max_tokens=420,
+                )
+                router._decrement_quota(usage_key)
+                if response.choices and response.choices[0].message:
+                    content = response.choices[0].message.content or ""
+                logger.info("[AutoSearchPlan] planned by gemma-3-27b-it (account=%s)", account_id)
+                break
+        except Exception:
+            logger.exception("[AutoSearchPlan] gemma planner failed; fallback to TextOnlyHigh")
+
+        if not content:
+            response = router.chat(
+                messages=decision_messages,
+                target_category="TextOnlyHigh",
+                include_chat_only=True,
+                temperature=0.0,
+                max_tokens=420,
+            )
+            if response.choices and response.choices[0].message:
+                content = response.choices[0].message.content or ""
+
+        parsed = _extract_json_object(content)
+        if not parsed:
+            logger.info("[AutoSearchPlan] parse failed; content_preview=%s", content[:160])
+            return fallback
+
+        raw_tasks = parsed.get("tasks", [])
+        if not isinstance(raw_tasks, list):
+            return fallback
+
+        normalized: List[Dict[str, Any]] = []
+        seen_queries = set()
+        for item in raw_tasks:
+            if not isinstance(item, dict):
+                continue
+            need = str(item.get("need", "")).strip()
+            task_query = _sanitize_search_query(str(item.get("query", "")))
+            why = str(item.get("why", "")).strip()
+            priority_raw = item.get("priority", len(normalized) + 1)
+            try:
+                priority = int(priority_raw)
+            except Exception:
+                priority = len(normalized) + 1
+
+            if not task_query:
+                continue
+            if task_query in seen_queries:
+                continue
+
+            seen_queries.add(task_query)
+            normalized.append(
+                {
+                    "need": need or "未命名資訊需求",
+                    "query": task_query,
+                    "why": why or "輔助回答",
+                    "priority": max(priority, 1),
+                }
+            )
+            if len(normalized) >= 4:
+                break
+
+        if not normalized:
+            return fallback
+
+        normalized.sort(key=lambda x: x.get("priority", 999))
+        return normalized
+    except Exception:
+        logger.exception("[AutoSearchPlan] planning call failed")
+        return fallback
+
+
+def _llm_review_answer_completeness(
+    router: Any,
+    user_prompt: str,
+    draft_answer: str,
+    evidence_summary: str,
+) -> Dict[str, Any]:
+    """Review whether the draft answer is complete/correct for the user prompt.
+
+    Returns:
+      {
+        "is_complete": bool,
+        "reason": str,
+        "missing": List[str],
+        "next_queries": List[str],
+      }
+    """
+    default_result: Dict[str, Any] = {
+        "is_complete": True,
+        "reason": "fallback",
+        "missing": [],
+        "next_queries": [],
+    }
+
+    clean_prompt = _sanitize_search_query(user_prompt)
+    if not clean_prompt:
+        return default_result
+
+    reviewer_instruction = (
+        "你是回答品質審核器。請判斷草稿回答是否已正確且完整回答使用者問題。"
+        "你只能輸出單一 JSON 物件，不要輸出其他文字。"
+        "JSON 格式："
+        '{"is_complete": true|false, "reason": "一句話", '
+        '"missing": ["缺漏點1", "缺漏點2"], '
+        '"next_queries": ["下一輪搜尋關鍵字1", "下一輪搜尋關鍵字2"]}'
+        "規則：missing 最多 4 筆；next_queries 最多 3 筆；"
+        "若答案已足夠完整，missing 與 next_queries 應為空陣列。"
+    )
+    reviewer_context = (
+        f"使用者問題：{clean_prompt}\n\n"
+        f"目前草稿回答：\n{draft_answer[:8000]}\n\n"
+        f"可用證據摘要：\n{evidence_summary[:10000]}\n"
+    )
+    review_messages = [
+        {
+            "role": "system",
+            "content": reviewer_instruction,
+        },
+        {
+            "role": "user",
+            "content": reviewer_context,
+        },
+    ]
+
+    content = ""
+    try:
+        model_id = "gemma-3-27b-it"
+        accounts = []
+        if hasattr(router, "_get_provider_accounts"):
+            accounts = router._get_provider_accounts("Google")
+
+        for account in accounts:
+            account_id = account.get("id", "default")
+            usage_key = router.get_usage_key("Google", model_id, account_id)
+            if router._get_remaining_quota(usage_key) == 0:
+                continue
+
+            client = router._get_client("Google", account_id)
+            if hasattr(router, "record_internal_usage"):
+                router.record_internal_usage("gemma_answer_reviewer_calls")
+            gemma_user_prompt = f"{reviewer_instruction}\n\n{reviewer_context}"
+            response = client.chat.completions.create(
+                model=model_id,
+                messages=[{"role": "user", "content": gemma_user_prompt}],
+                temperature=0.0,
+                max_tokens=320,
+            )
+            router._decrement_quota(usage_key)
+            if response.choices and response.choices[0].message:
+                content = response.choices[0].message.content or ""
+            logger.info("[AnswerReview] reviewed by gemma-3-27b-it (account=%s)", account_id)
+            break
+    except Exception:
+        logger.exception("[AnswerReview] gemma review failed; fallback to TextOnlyHigh")
+
+    if not content:
+        try:
+            response = router.chat(
+                messages=review_messages,
+                target_category="TextOnlyHigh",
+                include_chat_only=True,
+                temperature=0.0,
+                max_tokens=320,
+            )
+            if response.choices and response.choices[0].message:
+                content = response.choices[0].message.content or ""
+        except Exception:
+            logger.exception("[AnswerReview] fallback review failed")
+            return default_result
+
+    parsed = _extract_json_object(content)
+    if not parsed:
+        logger.info("[AnswerReview] parse failed; content_preview=%s", content[:160])
+        return default_result
+
+    is_complete_raw = parsed.get("is_complete", True)
+    is_complete = bool(is_complete_raw) if isinstance(is_complete_raw, bool) else True
+    reason = str(parsed.get("reason", "")).strip() or ""
+
+    missing_raw = parsed.get("missing", [])
+    missing: List[str] = []
+    if isinstance(missing_raw, list):
+        for item in missing_raw[:4]:
+            if isinstance(item, str) and item.strip():
+                missing.append(item.strip())
+
+    next_queries_raw = parsed.get("next_queries", [])
+    next_queries: List[str] = []
+    if isinstance(next_queries_raw, list):
+        for item in next_queries_raw[:3]:
+            if not isinstance(item, str):
+                continue
+            cleaned = _sanitize_search_query(item)
+            if cleaned:
+                next_queries.append(cleaned)
+
+    return {
+        "is_complete": is_complete,
+        "reason": reason,
+        "missing": missing,
+        "next_queries": next_queries,
+    }

@@ -54,3 +54,11 @@ class FileContentRequest(BaseModel):
     prompt: str
     temperature: Optional[float] = 0.7
     max_tokens: Optional[int] = None
+
+
+class ImageGenerationRequest(BaseModel):
+    model: str = "black-forest-labs/FLUX.1-schnell"
+    prompt: str
+    n: Optional[int] = 1
+    size: Optional[str] = "1024x1024"
+    response_format: Optional[str] = "b64_json"

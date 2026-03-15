@@ -20,11 +20,34 @@
 
 ✅ **引用與來源回傳** - 搜尋型回答可附 `citations`，並要求輸出參考來源
 
+✅ **多模態自動路由** - 同一個 `/v1/chat/completions` 可接圖像與最多 5 份文件，只有必要時才切到多模態模型
+
 ✅ **智慧記憶功能** - Pre-chat 分析，自動查詢歷史日誌（使用 gemma-3-27b-it）⭐ NEW
+
+✅ **Gemma 統一意圖分類** - chat / multimodal / memory / image generation 先走 gemma-3-27b-it 分類，再決定後續路徑
+
+✅ **主動式研究管線** - 複雜問題可自動拆成多個搜尋任務，逐步蒐集資料再合成答案
+
+✅ **答案完整性審核回圈** - 第一版回答完成後，Gemma reviewer 可自動判斷缺漏並補查一次再重寫
+
+✅ **資料驅動圖片生成** - K 線圖、趨勢圖、dashboard、infographic 類需求會先查資料，再把 evidence 注入圖片 prompt
+
+✅ **程式碼輸出強制標準** - 程式碼任務預設要求完整可執行實作、`main()`、至少 2 組測資、複雜度與邊界條件
+
+✅ **內部 Gemma 用量可視化** - Dashboard 可直接看到 classifier / planner / reviewer 等內部 helper 呼叫次數
 
 ✅ **Web UI** - React 前端儀錶板，實時查看配額和對話
 
 ✅ **自動文檔** - FastAPI 自動生成 API 文檔
+
+## 今日功能強化
+
+- 對話入口改為先做 Gemma 統一意圖分類，再決定文字聊天、多模態、記憶查詢或自動生圖
+- 搜尋型問題新增 `需求拆解 -> 多次搜尋 -> 彙整 -> reviewer 檢查 -> 必要時補查` 的單次閉環
+- 自動生圖新增資料型圖片管線，像股價 K 線圖這類需求會先查資料再生成
+- 程式碼任務新增最低輸出標準，避免只回片段或概念摘要
+- 回答風格新增研究型工作摘要模式，支援複雜任務但不暴露 raw chain-of-thought
+- `/admin/status` 與前端 dashboard 會顯示內部 Gemma helper 用量與多 account 配額明細
 
 ## 📸 功能展示
 
@@ -64,9 +87,13 @@
 ```bash
 # Google Gemini API Key
 GOOGLE_API_KEY=your_google_api_key
+GOOGLE_API_KEY_1=your_google_api_key_account_1
+GOOGLE_API_KEY_2=your_google_api_key_account_2
 
 # GitHub Models API Key (可選)
 GITHUB_MODELS_API_KEY=your_github_token
+GITHUB_MODELS_API_KEY_1=your_github_token_account_1
+GITHUB_MODELS_API_KEY_2=your_github_token_account_2
 
 # API 服務配置
 API_HOST=127.0.0.1
@@ -120,9 +147,12 @@ python api.py
 | `/health` | `GET`/`POST` | 健康檢查 |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API |
 | `/v1/completions` | POST | OpenAI Completions API (legacy) |
+| `/v1/images/generations` | POST | OpenAI Images API (HuggingFace / open-source image models) |
 | `/v1/direct_query` | POST | 直接查詢指定 provider/model |
 | `/v1/file/generate_content` | POST | 上傳圖片或文件並生成內容 |
 | `/v1/models` | GET/POST | 列出所有可用模型 |
+
+`/v1/models` 會額外回傳 `capabilities`，用來描述模型是否支援 image/document input 與特殊任務類型。
 
 ### 管理接口
 
@@ -155,10 +185,28 @@ python api.py
 
 1. 使用者訊息送到 `/v1/chat/completions`
 2. 如果宣告了 web search 工具，gateway 先判斷是否真的需要搜尋
-3. 若需要，先回 `tool_calls`
+3. 若需要，會先規劃搜尋任務，再回 `tool_calls`
 4. client 執行工具或由 OpenClaw 走 MCP round trip
 5. 工具結果回到 `/v1/chat/completions`
 6. gateway 萃取來源、清理工具輸出，再交給模型做最終回答
+7. 若 reviewer 判定答案仍不完整，會再補做一次 follow-up 搜尋並重寫答案
+
+### 研究型回答流程
+
+- 適用於需要外部資料的複雜問題
+- 先由 Gemma 決定是否需要搜尋
+- 再由 Gemma 規劃多個資訊需求與 query
+- 逐項執行搜尋並整理 evidence
+- 產生第一版答案後，再由 Gemma reviewer 判斷是否仍有缺漏
+- 若有缺漏，會再補查一次並重生最終答案
+
+### 資料驅動圖片流程
+
+- 適用於 K 線圖、趨勢圖、統計圖、dashboard、infographic 等資料型圖片需求
+- 先判斷是否屬於 data-backed image request
+- 若是，先走搜尋規劃與資料蒐集
+- 將 evidence 注入 image prompt 後再交給 image model 生成
+- 回應可包含 `images`、`citations`、`research_tasks`
 
 ## Tool API List
 
@@ -208,6 +256,96 @@ python api.py
 | `enable_memory` | boolean | 啟用或停用記憶注入 |
 | `tools` | array | OpenAI-style tool definitions |
 | `tool_choice` | string/object | 控制工具策略 |
+| `attachments` | array | top-level 附件（自動注入成 content parts） |
+| `input_files` | array | top-level 文件陣列（轉為 `input_file`） |
+| `input_images` | array | top-level 圖像陣列（轉為 `image_url`） |
+| `enable_auto_image_generation` | boolean | 對話中自動判斷是否要改走 image generation |
+| `image_model` | string | 自動生圖時使用的 image model，預設為 HuggingFace FLUX |
+| `image_n` | integer | 自動生圖張數（1-4） |
+| `image_size` | string | 自動生圖尺寸 |
+
+### 多模態輸入
+
+`/v1/chat/completions` 保持同一個接口，但 `messages[].content` 可以是多段內容。
+
+目前支援的 content part：
+
+- `text`
+- `input_text`
+- `image_url`
+- `input_file`
+
+也支援直接從 request top-level 傳附件欄位（server 會自動注入到最後一則 `user` message）：
+
+- `attachments`: 可混合 `text` / `image_url` / `input_file`
+- `input_files`: 會轉成 `input_file` parts
+- `input_images`: 會轉成 `image_url` parts
+
+目前限制：
+
+- 一次最多 5 份文件
+- 已接上的文件預處理類型：`txt`、`csv`、`xlsx`、`pdf`
+
+處理方式：
+
+- 圖像會在需要時保留給多模態聊天模型
+- 文件會先做 server-side 文字抽取或摘要，再合併進 prompt
+- router 會先用較便宜的模型判斷是否真的需要切到 `MultiModal`
+- 若只是文件摘要分析，通常仍優先走較便宜的文字模型
+
+範例：
+
+```json
+{
+  "model": "auto",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "請根據這些附件做摘要"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
+        {
+          "type": "input_file",
+          "file_name": "report.pdf",
+          "mime_type": "application/pdf",
+          "file_data": "base64..."
+        }
+      ]
+    }
+  ]
+}
+```
+
+Top-level 附件欄位範例：
+
+```json
+{
+  "model": "auto",
+  "messages": [
+    {
+      "role": "user",
+      "content": "請根據附件整理重點"
+    }
+  ],
+  "input_files": [
+    {
+      "file_name": "sales.csv",
+      "mime_type": "text/csv",
+      "file_data": "base64..."
+    }
+  ],
+  "input_images": [
+    "data:image/png;base64,..."
+  ]
+}
+```
+
+多 key 行為：
+
+- 可同時設定 `GOOGLE_API_KEY`, `GOOGLE_API_KEY_1`, `GOOGLE_API_KEY_2`...（GitHub 同規則）
+- 生圖可另外設定 `HUGGINGFACE_API_KEY`, `HUGGINGFACE_API_KEY_1`, `HUGGINGFACE_API_KEY_2`...
+- Router 會將同 provider 同 model 展開成多個 account 路由節點並輪詢
+- 配額以 `provider|account|model` 追蹤，`/v1/models` 與 `/admin/status` 會回傳彙總與各 account 明細
 
 ### Message Object
 
@@ -623,6 +761,8 @@ llm-api/
 # Google Gemini API
 GOOGLE_API_KEY=your_google_api_key
 GOOGLE_API_URL=https://generativelanguage.googleapis.com/v1beta/openai/
+
+# 同一組 Google key 目前也用於多模態 chat / OCR 類請求
 
 # GitHub Models (可選)
 GITHUB_MODELS_API_KEY=your_github_personal_access_token

@@ -4,7 +4,7 @@ import time
 import json
 import logging
 import threading
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 from openai import OpenAI, RateLimitError, APITimeoutError, APIConnectionError, APIStatusError
 
@@ -53,10 +53,9 @@ class ModelRouter:
         self.usage_db_path = usage_db_path
         self._lock = threading.Lock()
         
-        # Lazy-loaded clients
-        self._google_client: Optional[OpenAI] = None
-        self._github_client: Optional[OpenAI] = None
-        self._ollama_client: Optional[OpenAI] = None
+        # Multi-account provider registry and lazy-loaded clients.
+        self._provider_accounts: Dict[str, List[Dict[str, str]]] = self._build_provider_accounts()
+        self._provider_clients: Dict[Tuple[str, str], OpenAI] = {}
 
         self._model_capabilities: Dict[str, Dict[str, Any]] = {
             "gemini-2.5-flash": {
@@ -81,15 +80,23 @@ class ModelRouter:
                 "chat_capable": False,
                 "task": "tts",
             },
-            "imagen-4-generate": {
+            "black-forest-labs/FLUX.1-schnell": {
                 "chat_capable": False,
                 "task": "image_generation",
             },
-            "imagen-4-ultra-generate": {
+            "stabilityai/stable-diffusion-xl-base-1.0": {
                 "chat_capable": False,
                 "task": "image_generation",
             },
-            "imagen-4-fast-generate": {
+            "imagen-4-generate-001": {
+                "chat_capable": False,
+                "task": "image_generation",
+            },
+            "imagen-4-ultra-generate-001": {
+                "chat_capable": False,
+                "task": "image_generation",
+            },
+            "imagen-4-fast-generate-001": {
                 "chat_capable": False,
                 "task": "image_generation",
             },
@@ -131,6 +138,17 @@ class ModelRouter:
                     "gemini-2.5-flash": 20,
                     "gemma-3-27b-it": 14400,
                 }
+            },
+            "ImageGeneration": {
+                "HuggingFace": {
+                    "black-forest-labs/FLUX.1-schnell": 200,
+                    "stabilityai/stable-diffusion-xl-base-1.0": 200,
+                },
+                "Google": {
+                    "imagen-4-generate-001": 25,
+                    "imagen-4-ultra-generate-001": 25,
+                    "imagen-4-fast-generate-001": 25,
+                }
             }
         }
         
@@ -138,15 +156,155 @@ class ModelRouter:
         self.priority_flags: Dict[str, int] = {
             cat: 0 for cat in self._config_limits.keys()
         }
-        self.priority_map: Dict[str, List[Dict[str, str]]] = {}
+        self.priority_map: Dict[str, List[Dict[str, Any]]] = {}
         self._local_remaining_rpd: Dict[str, int] = {}
+        self._internal_usage_stats: Dict[str, int] = {
+            "gemma_internal_calls": 0,
+            "gemma_intent_classifier_calls": 0,
+            "gemma_memory_classifier_calls": 0,
+            "gemma_image_classifier_calls": 0,
+            "gemma_search_planner_calls": 0,
+            "gemma_answer_reviewer_calls": 0,
+        }
 
         self._load_usage_db()
         self._build_priority_map()
         logger.info("🚀 ModelRouter 初始化完成。")
 
-    def get_usage_key(self, provider: str, model_id: str) -> str:
-        return f"{provider}|{model_id}"
+    def get_usage_key(self, provider: str, model_id: str, account_id: str = "default") -> str:
+        return f"{provider}|{account_id}|{model_id}"
+
+    def _collect_provider_accounts(
+        self,
+        provider_name: str,
+        api_key_env: str,
+        api_url_env: str,
+        default_base_url: str,
+    ) -> List[Dict[str, str]]:
+        account_map: Dict[str, Dict[str, str]] = {}
+
+        direct_key = os.environ.get(api_key_env)
+        if direct_key:
+            account_map["default"] = {
+                "id": "default",
+                "api_key": direct_key,
+                "base_url": os.environ.get(api_url_env, default_base_url),
+            }
+
+        key_pattern = re.compile(rf"^{re.escape(api_key_env)}_(\d+)$")
+        for env_name, env_value in os.environ.items():
+            match = key_pattern.match(env_name)
+            if not match:
+                continue
+            suffix = match.group(1)
+            if not env_value:
+                continue
+            url_value = os.environ.get(f"{api_url_env}_{suffix}", default_base_url)
+            account_map[suffix] = {
+                "id": suffix,
+                "api_key": env_value,
+                "base_url": url_value,
+            }
+
+        ordered_ids = sorted(
+            account_map.keys(),
+            key=lambda item: (item != "default", int(item) if item.isdigit() else 10**9),
+        )
+        accounts = [account_map[item] for item in ordered_ids]
+
+        if not accounts:
+            logger.warning("%s API key not configured; provider unavailable", provider_name)
+            accounts.append(
+                {
+                    "id": "default",
+                    "api_key": "dummy",
+                    "base_url": default_base_url,
+                }
+            )
+
+        return accounts
+
+    def _build_provider_accounts(self) -> Dict[str, List[Dict[str, str]]]:
+        provider_accounts: Dict[str, List[Dict[str, str]]] = {
+            "Google": self._collect_provider_accounts(
+                provider_name="Google",
+                api_key_env="GOOGLE_API_KEY",
+                api_url_env="GOOGLE_API_URL",
+                default_base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            ),
+            "GitHub": self._collect_provider_accounts(
+                provider_name="GitHub",
+                api_key_env="GITHUB_MODELS_API_KEY",
+                api_url_env="GITHUB_MODELS_API_URL",
+                default_base_url="https://models.github.ai/inference",
+            ),
+            "HuggingFace": self._collect_provider_accounts(
+                provider_name="HuggingFace",
+                api_key_env="HUGGINGFACE_API_KEY",
+                api_url_env="HUGGINGFACE_API_URL",
+                default_base_url="https://api-inference.huggingface.co",
+            ),
+            "Ollama": [
+                {
+                    "id": "default",
+                    "api_key": os.environ.get("OLLAMA_API_KEY", "ollama"),
+                    "base_url": os.environ.get("OLLAMA_API_URL", "http://localhost:11434/v1"),
+                }
+            ],
+        }
+
+        for provider_name, accounts in provider_accounts.items():
+            logger.info("[Accounts] %s configured accounts=%s", provider_name, [a["id"] for a in accounts])
+
+        return provider_accounts
+
+    def _get_provider_accounts(self, provider: str) -> List[Dict[str, str]]:
+        return self._provider_accounts.get(provider, [])
+
+    def get_provider_account_info(self, provider: str, account_id: str = "default") -> Dict[str, str]:
+        accounts = self._get_provider_accounts(provider)
+        for account in accounts:
+            if account.get("id") == account_id:
+                return account
+        if not accounts:
+            raise RuntimeError(f"Provider {provider} has no configured account")
+        return accounts[0]
+
+    def _get_client(self, provider: str, account_id: str = "default") -> OpenAI:
+        cache_key = (provider, account_id)
+        cached = self._provider_clients.get(cache_key)
+        if cached is not None:
+            return cached
+
+        account_info = None
+        for account in self._get_provider_accounts(provider):
+            if account.get("id") == account_id:
+                account_info = account
+                break
+
+        if account_info is None:
+            available = self._get_provider_accounts(provider)
+            if not available:
+                raise RuntimeError(f"Provider {provider} has no configured account")
+            account_info = available[0]
+
+        client = OpenAI(
+            api_key=account_info.get("api_key") or "dummy",
+            base_url=account_info.get("base_url"),
+            timeout=DEFAULT_TIMEOUT,
+        )
+        self._provider_clients[cache_key] = client
+        return client
+
+    def get_model_capabilities(self, model_id: str) -> Dict[str, Any]:
+        capabilities = self._model_capabilities.get(model_id, {})
+        return {
+            "chat_capable": bool(capabilities.get("chat_capable", True)),
+            "image_input": bool(capabilities.get("image_input", False)),
+            "document_input": bool(capabilities.get("document_input", False)),
+            "task": capabilities.get("task", "chat"),
+            "preferred_tasks": capabilities.get("preferred_tasks", []),
+        }
 
     # ─────────────────────────────────────────────────────────
     # 配額管理
@@ -171,11 +329,20 @@ class ModelRouter:
         for cat, providers in self._config_limits.items():
             for provider, models_dict in providers.items():
                 for model_id, rpd_value in models_dict.items():
-                    key = self.get_usage_key(provider, model_id)
-                    if key not in self._local_remaining_rpd:
-                        self._local_remaining_rpd[key] = rpd_value
+                    for account in self._get_provider_accounts(provider):
+                        account_id = account.get("id", "default")
+                        key = self.get_usage_key(provider, model_id, account_id)
+                        if key in self._local_remaining_rpd:
+                            continue
+
+                        legacy_key = f"{provider}|{model_id}"
+                        if account_id == "default" and legacy_key in self._local_remaining_rpd:
+                            self._local_remaining_rpd[key] = self._local_remaining_rpd[legacy_key]
+                            logger.info(f"遷移舊配額鍵: {legacy_key} -> {key}")
+                        else:
+                            self._local_remaining_rpd[key] = rpd_value
+                            logger.info(f"新增模型配額: {key} = {rpd_value}")
                         updated = True
-                        logger.info(f"新增模型配額: {key} = {rpd_value}")
         if updated:
             self._save_usage_db()
 
@@ -190,16 +357,21 @@ class ModelRouter:
     def _build_priority_map(self) -> None:
         """建立每個類別的模型優先順序列表。"""
         for cat in self._config_limits.keys():
-            ordered_list: List[Dict[str, str]] = []
+            ordered_list: List[Dict[str, Any]] = []
             cat_data = self._config_limits.get(cat, {})
             
             for provider in PROVIDER_ORDER:
                 if provider in cat_data:
                     for model_id in cat_data[provider].keys():
-                        ordered_list.append({
-                            "provider": provider,
-                            "model_id": model_id
-                        })
+                        accounts = self._get_provider_accounts(provider)
+                        if not accounts:
+                            continue
+                        for account in accounts:
+                            ordered_list.append({
+                                "provider": provider,
+                                "model_id": model_id,
+                                "account_id": account.get("id", "default"),
+                            })
             
             self.priority_map[cat] = ordered_list
 
@@ -211,8 +383,9 @@ class ModelRouter:
             for cat, providers in self._config_limits.items():
                 for provider, models_dict in providers.items():
                     for model_id, rpd_value in models_dict.items():
-                        # rpd_value 直接是數字 (-1 表示無限制)
-                        self._local_remaining_rpd[self.get_usage_key(provider, model_id)] = rpd_value
+                        for account in self._get_provider_accounts(provider):
+                            account_id = account.get("id", "default")
+                            self._local_remaining_rpd[self.get_usage_key(provider, model_id, account_id)] = rpd_value
             
             # 重置所有類別的優先順序指標
             self.priority_flags = {cat: 0 for cat in self._config_limits.keys()}
@@ -231,39 +404,15 @@ class ModelRouter:
     # ─────────────────────────────────────────────────────────
     @property
     def google(self) -> OpenAI:
-        if self._google_client is None:
-            api_key = os.environ.get("GOOGLE_API_KEY")
-            if not api_key:
-                logger.warning("GOOGLE_API_KEY 未設定，Google 後端將無法使用")
-            self._google_client = OpenAI(
-                api_key=api_key or "dummy",
-                base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-                timeout=DEFAULT_TIMEOUT
-            )
-        return self._google_client
+        return self._get_client("Google", "default")
 
     @property
     def github(self) -> OpenAI:
-        if self._github_client is None:
-            api_key = os.environ.get("GITHUB_MODELS_API_KEY")
-            if not api_key:
-                logger.warning("GITHUB_MODELS_API_KEY 未設定，GitHub 後端將無法使用")
-            self._github_client = OpenAI(
-                api_key=api_key or "dummy",
-                base_url="https://models.github.ai/inference",
-                timeout=DEFAULT_TIMEOUT
-            )
-        return self._github_client
+        return self._get_client("GitHub", "default")
 
     @property
     def ollama(self) -> OpenAI:
-        if self._ollama_client is None:
-            self._ollama_client = OpenAI(
-                api_key="ollama",
-                base_url="http://localhost:11434/v1",
-                timeout=DEFAULT_TIMEOUT
-            )
-        return self._ollama_client
+        return self._get_client("Ollama", "default")
 
     # ─────────────────────────────────────────────────────────
     # 核心路由邏輯
@@ -286,6 +435,16 @@ class ModelRouter:
         with self._lock:
             self._local_remaining_rpd[usage_key] = 0
             self._save_usage_db()
+
+    def record_internal_usage(self, metric: str) -> None:
+        """Thread-safe internal usage counter for non-user-visible helper calls."""
+        with self._lock:
+            self._internal_usage_stats["gemma_internal_calls"] = self._internal_usage_stats.get("gemma_internal_calls", 0) + 1
+            self._internal_usage_stats[metric] = self._internal_usage_stats.get(metric, 0) + 1
+
+    def get_internal_usage_stats(self) -> Dict[str, int]:
+        with self._lock:
+            return dict(self._internal_usage_stats)
 
     def _update_priority_flag(self, category: str, index: int) -> None:
         """Thread-safe 更新優先順序指標。"""
@@ -580,7 +739,7 @@ class ModelRouter:
 
     def _try_models(
         self,
-        model_list: List[Dict[str, str]],
+        model_list: List[Dict[str, Any]],
         category: str,
         start_idx: int,
         messages: List[Dict[str, Any]],
@@ -607,7 +766,8 @@ class ModelRouter:
             m = model_list[i]
             model_id = m["model_id"]
             provider = m["provider"]
-            usage_key = self.get_usage_key(provider, model_id)
+            account_id = str(m.get("account_id", "default"))
+            usage_key = self.get_usage_key(provider, model_id, account_id)
             attempted_count += 1
             
             # 檢查配額
@@ -616,13 +776,20 @@ class ModelRouter:
                 continue
             
             try:
-                client = getattr(self, provider.lower())
+                client = self._get_client(provider, account_id)
                 
                 # Log: 嘗試路由
                 user_query = messages[-1].get('content', '') if messages else ""
                 flattened_query = self._flatten_content_for_log(user_query)
                 query_preview = flattened_query[:50] + "..." if len(flattened_query) > 50 else flattened_query
-                logger.info(f"[Route Try] Cat: {category} | Model: {model_id} | Query: {query_preview}")
+                logger.info(
+                    "[Route Try] Cat: %s | Provider: %s | Account: %s | Model: %s | Query: %s",
+                    category,
+                    provider,
+                    account_id,
+                    model_id,
+                    query_preview,
+                )
                 
                 # 執行呼叫（帶重試）
                 response = self._call_with_retry(client, model_id, messages, **kwargs)
@@ -667,7 +834,13 @@ class ModelRouter:
                     continue
                 
                 answer_preview = answer[:100] + "..." if len(answer) > 100 else answer
-                logger.info(f"[Success] Provider: {provider} | Model: {model_id} | Answer: {answer_preview}")
+                logger.info(
+                    "[Success] Provider: %s | Account: %s | Model: %s | Answer: %s",
+                    provider,
+                    account_id,
+                    model_id,
+                    answer_preview,
+                )
                 
                 # 扣減配額
                 self._decrement_quota(usage_key)
@@ -779,6 +952,39 @@ class ModelRouter:
             logger.critical(f"[Critical] Chat Error: {type(e).__name__}: {e}")
             raise
 
+    def get_model_quota_summary(self, provider: str, model_id: str, rpd_limit: int) -> Dict[str, Any]:
+        accounts = self._get_provider_accounts(provider)
+        account_status: List[Dict[str, Any]] = []
+        aggregate_limit = 0
+        aggregate_remaining = 0
+        has_unlimited = rpd_limit == -1
+
+        for account in accounts:
+            account_id = account.get("id", "default")
+            usage_key = self.get_usage_key(provider, model_id, account_id)
+            remaining = self._local_remaining_rpd.get(usage_key, rpd_limit)
+            account_status.append(
+                {
+                    "account_id": account_id,
+                    "limit": rpd_limit,
+                    "remaining": remaining,
+                    "used": 0 if rpd_limit == -1 or remaining == -1 else max(rpd_limit - remaining, 0),
+                }
+            )
+
+            if rpd_limit == -1 or remaining == -1:
+                has_unlimited = True
+                continue
+            aggregate_limit += rpd_limit
+            aggregate_remaining += remaining
+
+        return {
+            "accounts": account_status,
+            "rpd_limit": -1 if has_unlimited else aggregate_limit,
+            "rpd_remaining": -1 if has_unlimited else aggregate_remaining,
+            "provider_account_count": len(accounts),
+        }
+
     # ─────────────────────────────────────────────────────────
     # 記憶功能
     # ─────────────────────────────────────────────────────────
@@ -852,26 +1058,40 @@ class ModelRouter:
 
         # 使用 gemma-3-27b-it
         model_id = "gemma-3-27b-it"
-        usage_key = self.get_usage_key("Google", model_id)
+        google_accounts = self._get_provider_accounts("Google")
         
         try:
-            # 檢查配額
-            remaining = self._get_remaining_quota(usage_key)
-            if remaining == 0:
-                logger.warning(f"[Pre-chat] {model_id} 配額已用完，使用關鍵字匹配")
+            response = None
+            selected_usage_key = None
+
+            for account in google_accounts:
+                account_id = account.get("id", "default")
+                usage_key = self.get_usage_key("Google", model_id, account_id)
+                remaining = self._get_remaining_quota(usage_key)
+                if remaining == 0:
+                    continue
+                client = self._get_client("Google", account_id)
+                self.record_internal_usage("gemma_memory_classifier_calls")
+                response = client.chat.completions.create(
+                    model=model_id,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.0,
+                    max_tokens=10
+                )
+                selected_usage_key = usage_key
+                break
+
+            if response is None:
+                logger.warning(f"[Pre-chat] {model_id} 所有 Google 帳戶配額已用完，使用關鍵字匹配")
                 return has_keyword
-            
-            # 調用模型
-            response = self.google.chat.completions.create(
-                model=model_id,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                max_tokens=10
-            )
-            
-            # 成功後扣減配額
-            self._decrement_quota(usage_key)
-            logger.info(f"[Pre-chat] {model_id} 調用成功，配額剩餘: {self._get_remaining_quota(usage_key)}")
+
+            if selected_usage_key is not None:
+                self._decrement_quota(selected_usage_key)
+                logger.info(
+                    "[Pre-chat] %s 調用成功，配額剩餘: %s",
+                    model_id,
+                    self._get_remaining_quota(selected_usage_key),
+                )
             
             result = (response.choices[0].message.content or "").strip().lower()
             logger.info(f"[Pre-chat] {model_id} 判斷結果: {result}")
@@ -880,11 +1100,214 @@ class ModelRouter:
             
         except RateLimitError as e:
             logger.error(f"[Pre-chat] {model_id} 配額用完: {e}")
-            self._mark_quota_exhausted(usage_key)
+            for account in google_accounts:
+                usage_key = self.get_usage_key("Google", model_id, account.get("id", "default"))
+                self._mark_quota_exhausted(usage_key)
             return has_keyword
                 
         except Exception as e:
             logger.error(f"[Pre-chat] {model_id} 調用失敗: {e}，使用關鍵字匹配")
+            return has_keyword
+
+    def classify_intent(
+        self,
+        user_message: str,
+        has_image_input: bool = False,
+        has_file_input: bool = False,
+        file_kinds: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Unified Gemma-3-27B classifier — single entry point for all routing decisions.
+
+        Replaces separate check_need_image_generation / decide_multimodal_category /
+        check_need_log_rag calls. Routes every request through gemma-3-27b-it first,
+        with regex keyword fallback when the model is unavailable.
+
+        Returns a dict:
+            intent: "image_generation" | "memory_query" | "multimodal" | "text_chat"
+            multimodal_format: "image" | "document" | None
+            reason: brief one-line explanation
+        """
+        _file_kinds: List[str] = list(file_kinds or [])
+        default_result: Dict[str, Any] = {
+            "intent": "text_chat",
+            "multimodal_format": None,
+            "reason": "default",
+        }
+
+        if not user_message or not user_message.strip():
+            if has_image_input:
+                return {"intent": "multimodal", "multimodal_format": "image", "reason": "image input, no text"}
+            return default_result
+
+        prompt = (
+            "你是一個智慧路由分類器。根據使用者訊息與附件資訊，判斷應路由至哪個處理模組。\n\n"
+            f"使用者訊息：{user_message}\n"
+            f"有圖片附件：{has_image_input}\n"
+            f"有文件附件：{has_file_input}\n"
+            f"檔案類型：{_file_kinds}\n\n"
+            "路由規則（只能選一個）：\n"
+            '- "image_generation"：使用者要求生成/繪製/產生/畫/create/generate 新圖片、插畫、海報、封面、logo 等視覺內容\n'
+            '- "memory_query"：使用者詢問過去對話、歷史記錄、先前討論、之前說過的話、log、日誌\n'
+            '- "multimodal"：使用者要求分析/OCR/理解/描述已附上的圖片或文件（需有附件）\n'
+            '- "text_chat"：程式碼、問答、翻譯、計算、摘要等一般文字任務\n\n'
+            "重要：若使用者既提供圖片又要求生成新圖（如「根據這張圖生成新版本」），優先選 image_generation。\n"
+            "只輸出一個 JSON，不含任何其他文字：\n"
+            '{"intent": "image_generation"|"memory_query"|"multimodal"|"text_chat", '
+            '"multimodal_format": "image"|"document"|null, "reason": "一句話"}'
+        )
+
+        model_id = "gemma-3-27b-it"
+        google_accounts = self._get_provider_accounts("Google")
+
+        try:
+            for account in google_accounts:
+                account_id = account.get("id", "default")
+                usage_key = self.get_usage_key("Google", model_id, account_id)
+                if self._get_remaining_quota(usage_key) == 0:
+                    continue
+                client = self._get_client("Google", account_id)
+                self.record_internal_usage("gemma_intent_classifier_calls")
+                response = client.chat.completions.create(
+                    model=model_id,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.0,
+                    max_tokens=80,
+                )
+                self._decrement_quota(usage_key)
+                raw_text = (response.choices[0].message.content or "").strip()
+                logger.info("[IntentClassifier] gemma-3-27b-it raw: %s", raw_text)
+
+                parsed = self._extract_json_object(raw_text)
+                if parsed and "intent" in parsed:
+                    intent = str(parsed.get("intent", "text_chat"))
+                    valid_intents = {"image_generation", "memory_query", "multimodal", "text_chat"}
+                    if intent not in valid_intents:
+                        intent = "text_chat"
+                    result: Dict[str, Any] = {
+                        "intent": intent,
+                        "multimodal_format": parsed.get("multimodal_format"),
+                        "reason": str(parsed.get("reason", "")),
+                    }
+                    logger.info(
+                        "[IntentClassifier] intent=%s multimodal_format=%s reason=%s",
+                        result["intent"], result["multimodal_format"], result["reason"],
+                    )
+                    return result
+                # Couldn't parse JSON; fall through to keyword fallback
+                break
+        except Exception as exc:
+            logger.warning("[IntentClassifier] gemma-3-27b-it failed: %s; using keyword fallback", exc)
+
+        # ─── Keyword fallback ──────────────────────────────
+        broad_generate_re = re.compile(
+            r"(生成.{0,24}(圖|圖片|图像|海報|海报|插畫|插画|封面|cover|logo|貼圖|贴图)"
+            r"|畫.{0,24}(圖|圖像|海報|海报|插畫|插画|封面|cover|logo|貼圖|贴图)"
+            r"|做.{0,24}(圖|海報|海报|插畫|插画|封面|cover|logo|貼圖|贴图)"
+            r"|create\s+an?\s+(image|illustration|cover|poster|logo)"
+            r"|generate\s+an?\s+(image|illustration|cover|poster|logo)"
+            r"|image\s*generation|cover\s*art|illustration|imagen)",
+            re.IGNORECASE,
+        )
+        analysis_hint_re = re.compile(
+            r"(分析|描述|辨識|识别|ocr|看圖|看图|解讀|解读|extract|read\s+text|what\s+is\s+in\s+this\s+image)",
+            re.IGNORECASE,
+        )
+        memory_re = re.compile(
+            r"(記憶|剛剛|之前|先前|上次|過去|歷史|記錄|log|日誌|memory|previously|last\s+time|chat\s+history)",
+            re.IGNORECASE,
+        )
+
+        if memory_re.search(user_message):
+            return {"intent": "memory_query", "multimodal_format": None, "reason": "keyword: memory"}
+
+        if (
+            IMAGE_GENERATION_INTENT_RE.search(user_message) or broad_generate_re.search(user_message)
+        ) and not analysis_hint_re.search(user_message):
+            return {"intent": "image_generation", "multimodal_format": None, "reason": "keyword: image generation"}
+
+        if has_image_input or has_file_input or MULTIMODAL_INTENT_RE.search(user_message):
+            fmt = "image" if has_image_input else "document"
+            return {"intent": "multimodal", "multimodal_format": fmt, "reason": "keyword/attachment: multimodal"}
+
+        return default_result
+
+    def check_need_image_generation(self, user_message: str) -> bool:
+        """Pre-chat: 判斷是否應該觸發 image generation 流程。"""
+        if not user_message or not user_message.strip():
+            return False
+
+        broad_generate_re = re.compile(
+            r"(生成.{0,24}(圖|圖片|图像|海報|海报|插畫|插画|封面|cover|logo|貼圖|贴图)"
+            r"|畫.{0,24}(圖|圖像|海報|海报|插畫|插画|封面|cover|logo|貼圖|贴图)"
+            r"|做.{0,24}(圖|海報|海报|插畫|插画|封面|cover|logo|貼圖|贴图)"
+            r"|create\s+an?\s+(image|illustration|cover|poster|logo)"
+            r"|generate\s+an?\s+(image|illustration|cover|poster|logo)"
+            r"|image\s*generation|cover\s*art|illustration|imagen)",
+            re.IGNORECASE,
+        )
+        has_keyword = bool(IMAGE_GENERATION_INTENT_RE.search(user_message) or broad_generate_re.search(user_message))
+        if not has_keyword:
+            return False
+
+        analysis_hint_re = re.compile(
+            r"(分析|描述|辨識|识别|ocr|看圖|看图|解讀|解读|extract|read\s+text|what\s+is\s+in\s+this\s+image)",
+            re.IGNORECASE,
+        )
+
+        model_id = "gemma-3-27b-it"
+        google_accounts = self._get_provider_accounts("Google")
+
+        prompt = f"""你是一個分類器。請判斷以下使用者輸入是否明確要求「生成新圖片」。
+
+使用者輸入：{user_message}
+
+規則：
+- 只有在使用者要你「生成/繪製/產生」新圖片時，回答 true
+- 如果只是要求分析、描述、OCR、比較已提供圖片，回答 false
+- 只輸出 true 或 false
+"""
+
+        try:
+            response = None
+            selected_usage_key = None
+
+            for account in google_accounts:
+                account_id = account.get("id", "default")
+                usage_key = self.get_usage_key("Google", model_id, account_id)
+                if self._get_remaining_quota(usage_key) == 0:
+                    continue
+
+                client = self._get_client("Google", account_id)
+                self.record_internal_usage("gemma_image_classifier_calls")
+                response = client.chat.completions.create(
+                    model=model_id,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.0,
+                    max_tokens=10,
+                )
+                selected_usage_key = usage_key
+                break
+
+            if response is None:
+                logger.warning("[ImageDecision] classifier quota unavailable, fallback keyword result=%s", has_keyword)
+                return has_keyword
+
+            if selected_usage_key is not None:
+                self._decrement_quota(selected_usage_key)
+
+            result = (response.choices[0].message.content or "").strip().lower()
+            logger.info("[ImageDecision] classifier result=%s", result)
+            if "true" in result:
+                return True
+            if analysis_hint_re.search(user_message):
+                return False
+            return has_keyword
+
+        except Exception as e:
+            logger.warning("[ImageDecision] classifier failed: %s, fallback keyword=%s", e, has_keyword)
+            if analysis_hint_re.search(user_message):
+                return False
             return has_keyword
 
     def read_app_log(self, max_lines: int = 100) -> str:

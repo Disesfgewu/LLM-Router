@@ -9,6 +9,8 @@ function App() {
   const [status, setStatus] = useState(null)
   const [models, setModels] = useState([])
   const [loading, setLoading] = useState(false)
+  const [backendOnline, setBackendOnline] = useState(true)
+  const [backendMessage, setBackendMessage] = useState('')
 
   // 獲取配額狀態
   const fetchStatus = async () => {
@@ -30,18 +32,35 @@ function App() {
     }
   }
 
+  const checkBackendHealth = async () => {
+    try {
+      await axios.get('/health')
+      setBackendOnline(true)
+      setBackendMessage('')
+      return true
+    } catch (error) {
+      setBackendOnline(false)
+      setBackendMessage('後端 API 目前無法連線（127.0.0.1:8000）。請先啟動 python api.py。')
+      return false
+    }
+  }
+
+  const fetchBackendData = async () => {
+    const healthy = await checkBackendHealth()
+    if (!healthy) return
+    await Promise.all([fetchStatus(), fetchModels()])
+  }
+
   // 初始載入
   useEffect(() => {
-    fetchStatus()
-    fetchModels()
+    fetchBackendData()
   }, [])
 
-  // 自動刷新 - 每 5 分鐘
+  // 自動刷新 - 每 20 秒（讓內部分類器配額變化可即時可見）
   useEffect(() => {
     const interval = setInterval(() => {
-      fetchStatus()
-      fetchModels()
-    }, 5 * 60 * 1000) // 5 分鐘
+      fetchBackendData()
+    }, 20 * 1000) // 20 秒
 
     return () => clearInterval(interval)
   }, [])
@@ -49,7 +68,7 @@ function App() {
   // 手動刷新
   const handleRefresh = async () => {
     setLoading(true)
-    await Promise.all([fetchStatus(), fetchModels()])
+    await fetchBackendData()
     setLoading(false)
   }
 
@@ -113,6 +132,12 @@ function App() {
 
       {/* Main Content */}
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
+        {!backendOnline && (
+          <div className="mb-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-amber-800">
+            <div className="font-semibold">後端連線異常</div>
+            <div className="text-sm mt-1">{backendMessage}</div>
+          </div>
+        )}
         {activeTab === 'chat' && <ChatInterface models={models} />}
         {activeTab === 'dashboard' && <Dashboard status={status} models={models} onRefresh={handleRefresh} />}
         {activeTab === 'logs' && <LogViewer />}
@@ -120,7 +145,7 @@ function App() {
 
       {/* Footer */}
       <footer className="mt-8 py-4 text-center text-gray-500 text-sm">
-        <p>自動刷新：每 5 分鐘 | ModelRouter API Gateway v1.0.0</p>
+        <p>自動刷新：每 20 秒 | ModelRouter API Gateway v1.0.0</p>
       </footer>
     </div>
   )

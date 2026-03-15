@@ -34,7 +34,11 @@ import time
 import logging
 import tempfile
 import json
-from typing import List, Optional, Dict, Any
+import io
+import base64
+import re
+import importlib
+from typing import List, Optional, Dict, Any, Literal, cast
 
 from dotenv import load_dotenv
 load_dotenv()  # 載入 .env 檔案
@@ -45,8 +49,19 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-import google.generativeai as genai
 import contextlib
+from huggingface_hub import InferenceClient
+
+try:
+    genai = importlib.import_module("google.generativeai")
+except ImportError:
+    genai = None
+
+try:
+    from opencc import OpenCC  # type: ignore
+    _opencc_converter = OpenCC("s2twp")
+except Exception:
+    _opencc_converter = None
 
 import mcp.server
 from mcp.server.sse import SseServerTransport
@@ -64,6 +79,290 @@ logger = logging.getLogger("api")
 # ── App Config ─────────────────────────────────────────────
 APP_TITLE = "ModelRouter API Gateway"
 APP_VERSION = "1.0.0"
+
+# ── Universal Agent Identity (injected into every LLM call) ─
+AGENT_SYSTEM_PROMPT = (
+    "You are an assistant agent developed by DisesFgewu via OpenClaw. "
+    "You are a helpful, harmless, and honest AI assistant. "
+    "Always respond in the user's language unless explicitly instructed otherwise. "
+    "If replying in Chinese, you MUST use Traditional Chinese (zh-TW) and concise style. "
+    "If the user asks for code, provide complete runnable code first, then concise usage notes. "
+    "For code tasks, enforce minimum output quality: include a compilable/executable main entry, at least 2 test cases, "
+    "and complexity + boundary-condition notes. "
+    "For research-backed answers, first align with the user's context in 1-2 short sentences, then provide a short visible work summary if tools/search were used, "
+    "and then give the direct answer. Do not expose raw chain-of-thought or hidden reasoning. "
+    "Answer format: start with one-line conclusion, then provide focused explanation and key points as needed "
+    "(usually 3-6 bullets for complex topics)."
+)
+
+IDENTITY_QUESTION_PREFIX = (
+    "You are an assistant agent developed by DisesFgewu via OpenClaw. "
+    "Answer the user's question. [Question] : "
+)
+
+
+def _contains_cjk(text: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+
+
+def _wrap_identity_question(question: str) -> str:
+    cleaned = (question or "").strip()
+    if cleaned.startswith(IDENTITY_QUESTION_PREFIX):
+        return cleaned
+    return f"{IDENTITY_QUESTION_PREFIX}{cleaned}"
+
+
+def _prepend_identity_prefix_to_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    wrapped: List[Dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            wrapped.append(message)
+            continue
+
+        role = str(message.get("role", ""))
+        if role != "user":
+            wrapped.append(message)
+            continue
+
+        content = message.get("content", "")
+        cloned = dict(message)
+
+        if isinstance(content, str):
+            cloned["content"] = _wrap_identity_question(content)
+            wrapped.append(cloned)
+            continue
+
+        if isinstance(content, list):
+            # Keep multimodal parts unchanged and add a leading text instruction part.
+            wrapped_parts = list(content)
+            if wrapped_parts:
+                first = wrapped_parts[0]
+                if isinstance(first, dict) and first.get("type") in {"text", "input_text"}:
+                    original_text = str(first.get("text") or first.get("input_text") or "")
+                    first_copy = dict(first)
+                    first_copy["type"] = "text"
+                    first_copy["text"] = _wrap_identity_question(original_text)
+                    wrapped_parts[0] = first_copy
+                else:
+                    wrapped_parts.insert(0, {"type": "text", "text": _wrap_identity_question("")})
+            else:
+                wrapped_parts = [{"type": "text", "text": _wrap_identity_question("")}]
+
+            cloned["content"] = wrapped_parts
+            wrapped.append(cloned)
+            continue
+
+        cloned["content"] = _wrap_identity_question(str(content))
+        wrapped.append(cloned)
+
+    return wrapped
+
+
+def _ensure_user_message_for_generation(messages: List[Dict[str, Any]], latest_user_text: str) -> List[Dict[str, Any]]:
+    """Google OpenAI-compatible endpoint requires at least one non-empty user content item."""
+    prepared = list(messages or [])
+    has_user_payload = any(
+        isinstance(m, dict)
+        and m.get("role") == "user"
+        and str(m.get("content", "")).strip()
+        for m in prepared
+    )
+    if has_user_payload:
+        return prepared
+
+    fallback_query = _wrap_identity_question((latest_user_text or "").strip() or "請根據上方內容回答。")
+    prepared.append({"role": "user", "content": fallback_query})
+    return prepared
+
+
+def _to_zh_tw_if_needed(user_text: str, content: str) -> str:
+    if not content:
+        return content
+    if _opencc_converter is None:
+        return content
+    if _contains_cjk(user_text) or _contains_cjk(content):
+        try:
+            return _opencc_converter.convert(content)
+        except Exception:
+            return content
+    return content
+
+
+def _is_code_generation_request(user_text: str) -> bool:
+    text = (user_text or "").lower()
+    if not text:
+        return False
+    code_markers = [
+        "幫我寫",
+        "寫一份",
+        "程式碼",
+        "代碼",
+        "實作",
+        "implement",
+        "implementation",
+        "write code",
+        "code",
+        "c++",
+        "python",
+        "java",
+        "javascript",
+        "golang",
+        "rust",
+    ]
+    return any(marker in text for marker in code_markers)
+
+
+def _looks_like_code_output(content: str) -> bool:
+    text = (content or "")
+    if "```" in text:
+        return True
+    if re.search(r"(?m)^\s*#include\s*<", text):
+        return True
+    if re.search(r"(?m)^\s*(class|struct|def|function)\s+", text):
+        return True
+    if re.search(r"(?m)^\s*for\s*\(|^\s*while\s*\(|^\s*if\s*\(", text):
+        return True
+    return False
+
+
+def _compress_answer_if_needed(user_text: str, content: str) -> str:
+    text = (content or "").strip()
+    if not text:
+        return text
+
+    # Never compress code-heavy outputs; preserve full implementation blocks.
+    if _is_code_generation_request(user_text) or _looks_like_code_output(text):
+        return text
+
+    if len(text) <= 1400:
+        return text
+
+    segments = [seg.strip() for seg in re.split(r"(?<=[。！？\n])", text) if seg.strip()]
+    if not segments:
+        return text
+
+    conclusion = segments[0]
+    if len(conclusion) > 90:
+        conclusion = conclusion[:90].rstrip("，,。!！?？ ") + "。"
+
+    key_points: List[str] = []
+    for seg in segments[1:]:
+        if len(key_points) >= 6:
+            break
+        if re.search(r"(°|℃|\d+|建議|注意|降雨|風|濕度|來源|參考)", seg):
+            normalized = re.sub(r"^[\-\*\d\.\)\s]+", "", seg)
+            key_points.append(normalized)
+
+    if not key_points and len(segments) > 1:
+        key_points = [re.sub(r"^[\-\*\d\.\)\s]+", "", segments[1])]
+
+    if conclusion.startswith("結論："):
+        compact_lines = [conclusion]
+    else:
+        compact_lines = [f"結論：{conclusion}"]
+    for item in key_points[:6]:
+        compact_lines.append(f"- {item}")
+    return "\n".join(compact_lines)
+
+
+def _cleanup_noisy_boilerplate(content: str) -> str:
+    text = (content or "").strip()
+    if not text:
+        return text
+
+    cleaned_lines: List[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            cleaned_lines.append(line)
+            continue
+        if "[Assistant requested tool:" in s:
+            continue
+        # Remove low-value citation disclaimer artifacts that often appear in non-factual Q&A.
+        if "目前無具體來源 URL" in s:
+            continue
+        if "僅憑技術能力回答" in s:
+            continue
+        cleaned_lines.append(line)
+
+    cleaned = "\n".join(cleaned_lines).strip()
+    return cleaned or text
+
+
+def _postprocess_user_response(user_text: str, content: str) -> str:
+    compact = _cleanup_noisy_boilerplate(content)
+    compact = _compress_answer_if_needed(user_text, compact)
+    return _to_zh_tw_if_needed(user_text, compact)
+
+
+def _sanitize_messages_for_model(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Drop tool-call transcript artifacts before sending context to the generation model."""
+    sanitized: List[Dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+
+        role = str(message.get("role", "user"))
+        content = message.get("content", "")
+        if not isinstance(content, str):
+            sanitized.append(message)
+            continue
+
+        if "[Assistant requested tool:" in content:
+            kept_lines = [
+                ln for ln in content.splitlines()
+                if "[Assistant requested tool:" not in ln
+            ]
+            cleaned = "\n".join(kept_lines).strip()
+            if not cleaned:
+                # Pure tool-request transcript is not useful generation context.
+                continue
+            cloned = dict(message)
+            cloned["content"] = cleaned
+            sanitized.append(cloned)
+            continue
+
+        sanitized.append(message)
+
+    return sanitized
+
+
+def _append_code_output_requirements(messages: List[Dict[str, Any]], user_text: str) -> List[Dict[str, Any]]:
+    if not _is_code_generation_request(user_text):
+        return messages
+
+    requirements = (
+        "程式碼輸出最低要求："
+        "1) 必須提供可直接編譯/執行的完整程式，且包含 main() 入口。"
+        "2) 必須提供至少 2 組測資（可用輸入/輸出示例或程式內測試）。"
+        "3) 必須列出時間複雜度、空間複雜度與主要邊界條件。"
+        "若使用者需求有歧義，請做最小必要假設並在註解或說明中明確寫出。"
+    )
+    return list(messages) + [{"role": "system", "content": requirements}]
+
+
+def _research_answer_style_instruction() -> str:
+    return (
+        "若本題有使用搜尋、工具或外部資料，回答格式請遵守："
+        "先用 1 至 2 句簡短對齊使用者情境與你採用的做法，例如『收到，你是用這個 fork，我改成直接對著這個 repo 看』。"
+        "接著可加一個很短的『活動』區塊，列出 3 至 5 個已執行的工作摘要，例如查了哪些文件、找了哪些設定、核對了哪些流程；"
+        "這是對外可見的工作摘要，不是逐字思考過程。"
+        "之後直接給答案、步驟、設定片段與注意事項。"
+        "禁止輸出『正在思考』、『我先想一下』這類內部推理字樣；"
+        "若要描述流程，請改寫成已完成或正在進行的工作摘要。"
+    )
+
+
+def _inject_agent_system_prompt(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Ensure AGENT_SYSTEM_PROMPT is the first system message in every LLM call."""
+    if not messages:
+        return [{"role": "system", "content": AGENT_SYSTEM_PROMPT}]
+    if messages[0].get("role") == "system":
+        existing = str(messages[0].get("content", ""))
+        merged = list(messages)
+        merged[0] = {"role": "system", "content": f"{AGENT_SYSTEM_PROMPT}\n\n{existing}".strip()}
+        return merged
+    return [{"role": "system", "content": AGENT_SYSTEM_PROMPT}] + list(messages)
 
 # ── MCP Server Setup ───────────────────────────────────────
 mcp_server = mcp.server.Server("modelrouter-mcp")
@@ -187,9 +486,11 @@ async def lifespan(app: FastAPI):
     logger.info("🔧 初始化自動定時任務...")
     
     google_api_key = os.getenv("GOOGLE_API_KEY")
-    if google_api_key:
+    if google_api_key and genai is not None:
         genai.configure(api_key=google_api_key)  # type: ignore[attr-defined]
         logger.info("✅ Google Generative AI 已初始化")
+    elif google_api_key and genai is None:
+        logger.warning("⚠️  google-generativeai 套件未安裝，Google 文件上傳功能將無法使用")
     else:
         logger.warning("⚠️  GOOGLE_API_KEY 未設定，文件上傳功能將無法使用")
     
@@ -236,6 +537,192 @@ def get_router() -> ModelRouter:
     return router_instance
 
 
+def _run_image_generation_with_router(
+    router: ModelRouter,
+    *,
+    prompt: str,
+    model: str,
+    n: int,
+    size: str,
+    response_format: str,
+    source_image_bytes: Optional[bytes] = None,
+) -> Dict[str, Any]:
+    provider_name = ""
+    model_limit = 25
+    for candidate_provider, models_dict in router._config_limits.get("ImageGeneration", {}).items():
+        if model in models_dict:
+            provider_name = candidate_provider
+            model_limit = models_dict.get(model, 25)
+            break
+
+    if not provider_name:
+        raise HTTPException(status_code=400, detail=f"unknown image generation model: {model}")
+
+    model_candidates = [model]
+    if provider_name == "HuggingFace":
+        available_hf_models = list(router._config_limits.get("ImageGeneration", {}).get("HuggingFace", {}).keys())
+        model_candidates.extend([candidate for candidate in available_hf_models if candidate != model])
+
+    accounts = router._get_provider_accounts(provider_name)
+    if not accounts:
+        raise HTTPException(status_code=503, detail=f"{provider_name} provider has no available accounts")
+
+    response_format_raw = (response_format or "b64_json").lower()
+    if response_format_raw not in {"b64_json", "url"}:
+        raise HTTPException(status_code=400, detail="response_format must be 'b64_json' or 'url'")
+    response_format_value = cast(Literal["b64_json", "url"], response_format_raw)
+
+    size_raw = size or "1024x1024"
+    allowed_sizes = {"auto", "1024x1024", "1536x1024", "1024x1536", "256x256", "512x512", "1792x1024", "1024x1792"}
+    if size_raw not in allowed_sizes:
+        raise HTTPException(status_code=400, detail=f"unsupported size: {size_raw}")
+    size_value = cast(
+        Literal["auto", "1024x1024", "1536x1024", "1024x1536", "256x256", "512x512", "1792x1024", "1024x1792"],
+        size_raw,
+    )
+
+    count = int(n or 1)
+    if count < 1:
+        count = 1
+    if count > 4:
+        count = 4
+
+    last_error = None
+    for candidate_model in model_candidates:
+        candidate_limit = router._config_limits.get("ImageGeneration", {}).get(provider_name, {}).get(candidate_model, model_limit)
+        for account in accounts:
+            account_id = account.get("id", "default")
+            usage_key = router.get_usage_key(provider_name, candidate_model, account_id)
+            if router._get_remaining_quota(usage_key) == 0:
+                continue
+
+            account_info = router.get_provider_account_info(provider_name, account_id)
+            try:
+                items: List[Dict[str, Any]] = []
+
+                if provider_name == "HuggingFace":
+                    client = InferenceClient(
+                        provider="hf-inference",
+                        api_key=account_info.get("api_key") or None,
+                    )
+                    width, height = _parse_image_size_for_hf(size_value)
+                    hf_prompt = _build_hf_prompt(prompt, bool(source_image_bytes))
+                    generation_kwargs: Dict[str, Any] = {
+                        "model": candidate_model,
+                        "negative_prompt": (
+                            "off-topic, irrelevant subject, blurry, low quality, distorted anatomy, "
+                            "extra limbs, watermark, logo, text overlay"
+                        ),
+                    }
+                    if width and height:
+                        generation_kwargs["width"] = width
+                        generation_kwargs["height"] = height
+
+                    # Keep defaults model-aware to improve prompt adherence.
+                    if "FLUX.1-schnell" in candidate_model:
+                        generation_kwargs["num_inference_steps"] = 8
+                    elif "stable-diffusion-xl" in candidate_model:
+                        generation_kwargs["num_inference_steps"] = 30
+                        generation_kwargs["guidance_scale"] = 7.0
+
+                    for _ in range(count):
+                        image = None
+                        if source_image_bytes and hasattr(client, "image_to_image"):
+                            try:
+                                image = client.image_to_image(
+                                    image=source_image_bytes,
+                                    prompt=hf_prompt,
+                                    **generation_kwargs,
+                                )
+                                logger.info(
+                                    "[ImageGeneration] HF image_to_image used (model=%s, account=%s)",
+                                    candidate_model,
+                                    account_id,
+                                )
+                            except Exception as img2img_error:
+                                logger.warning(
+                                    "[ImageGeneration] HF image_to_image failed, fallback to text_to_image: %s",
+                                    img2img_error,
+                                )
+
+                        if image is None:
+                            try:
+                                image = client.text_to_image(hf_prompt, **generation_kwargs)
+                            except TypeError:
+                                image = client.text_to_image(hf_prompt, model=candidate_model)
+
+                        buffer = io.BytesIO()
+                        if hasattr(image, "save"):
+                            image.save(buffer, format="PNG")
+                            image_bytes = buffer.getvalue()
+                        elif isinstance(image, (bytes, bytearray)):
+                            image_bytes = bytes(image)
+                        else:
+                            raise RuntimeError(f"unsupported HF image response type: {type(image)!r}")
+
+                        encoded = base64.b64encode(image_bytes).decode("ascii")
+                        row: Dict[str, Any] = {"b64_json": encoded}
+                        if response_format_value == "url":
+                            row["url"] = f"data:image/png;base64,{encoded}"
+                        items.append(row)
+                else:
+                    client = router._get_client(provider_name, account_id)
+                    resp = client.images.generate(
+                        model=candidate_model,
+                        prompt=prompt,
+                        n=count,
+                        size=size_value,
+                        response_format=response_format_value,
+                    )
+                    for item in getattr(resp, "data", []) or []:
+                        row = {}
+                        if hasattr(item, "b64_json") and getattr(item, "b64_json"):
+                            row["b64_json"] = getattr(item, "b64_json")
+                        if hasattr(item, "url") and getattr(item, "url"):
+                            row["url"] = getattr(item, "url")
+                        if hasattr(item, "revised_prompt") and getattr(item, "revised_prompt"):
+                            row["revised_prompt"] = getattr(item, "revised_prompt")
+                        items.append(row)
+
+                router._decrement_quota(usage_key)
+
+                return {
+                    "created": int(time.time()),
+                    "data": items,
+                    "model": candidate_model,
+                    "provider": provider_name,
+                    "account_id": account_id,
+                    "usage": {
+                        "prompt_tokens": len(prompt) // 4,
+                        "completion_tokens": 0,
+                        "total_tokens": len(prompt) // 4,
+                    },
+                    "quota": router.get_model_quota_summary(provider_name, candidate_model, candidate_limit),
+                }
+            except Exception as exc:
+                last_error = exc
+                message = str(exc).lower()
+                if "rate" in message or "quota" in message:
+                    router._mark_quota_exhausted(usage_key)
+                logger.warning(
+                    "[ImageGeneration] provider=%s account=%s model=%s failed: %s",
+                    provider_name,
+                    account_id,
+                    candidate_model,
+                    exc,
+                )
+                # Deprecated or unavailable HF model: keep trying the next configured model.
+                if provider_name == "HuggingFace" and any(token in message for token in ["410", "deprecated", "not found", "404"]):
+                    continue
+                if provider_name == "HuggingFace" and candidate_model != model:
+                    continue
+
+    raise HTTPException(
+        status_code=503,
+        detail=f"image generation unavailable for model {model}: {last_error}",
+    )
+
+
 # ── Scheduler for Auto-Reset ───────────────────────────────
 scheduler = BackgroundScheduler()
 
@@ -259,6 +746,232 @@ def refresh_rpm_job():
     except Exception as e:
         logger.error(f"❌ [Scheduled] 優先順序指標重置失敗: {e}")
 
+
+def _extract_first_data_image_from_messages(messages: List[Any]) -> Optional[bytes]:
+    """Extract first base64 data-url image bytes from user messages, if any."""
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+
+        content = message.get("content", "")
+        if not isinstance(content, list):
+            continue
+
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+
+            part_type = str(part.get("type") or "")
+            if part_type not in {"image_url", "input_image"}:
+                continue
+
+            image_url_obj = part.get("image_url")
+            url = ""
+            if isinstance(image_url_obj, dict) and isinstance(image_url_obj.get("url"), str):
+                url = image_url_obj.get("url") or ""
+            elif isinstance(part.get("url"), str):
+                url = part.get("url") or ""
+
+            if not url.startswith("data:image") or "," not in url:
+                continue
+
+            try:
+                encoded = url.split(",", 1)[1]
+                return base64.b64decode(encoded)
+            except Exception as decode_error:
+                logger.warning("[ImageGeneration] Failed to decode input data image: %s", decode_error)
+                continue
+
+    return None
+
+
+def _parse_image_size_for_hf(size: str) -> tuple[Optional[int], Optional[int]]:
+    if not size or size == "auto":
+        return None, None
+
+    match = re.match(r"^(\d+)x(\d+)$", size)
+    if not match:
+        return None, None
+
+    width = int(match.group(1))
+    height = int(match.group(2))
+    if width <= 0 or height <= 0:
+        return None, None
+    return width, height
+
+
+def _build_hf_prompt(user_prompt: str, has_source_image: bool) -> str:
+    cleaned = (user_prompt or "").strip()
+    if not cleaned:
+        cleaned = "Create a high-quality image"
+
+    base = (
+        "Create a high-quality, visually coherent image that strictly follows this request. "
+        "Main subject and scene must stay on-topic and central. "
+        "If style is not specified, use cinematic lighting, detailed textures, and clean composition."
+    )
+
+    if has_source_image:
+        return (
+            f"{base} Use the provided source image as reference for composition and visual identity, "
+            f"while applying the requested transformation.\n"
+            f"User request: {cleaned}"
+        )
+
+    return f"{base}\nUser request: {cleaned}"
+
+
+def _is_data_backed_image_request(user_text: str) -> bool:
+    text = (user_text or "").lower()
+    if not text:
+        return False
+    markers = [
+        "k線",
+        "k 棒",
+        "candlestick",
+        "股價",
+        "股票",
+        "走勢圖",
+        "chart",
+        "plot",
+        "graph",
+        "dashboard",
+        "infographic",
+        "統計圖",
+        "數據圖",
+        "市場",
+        "weather map",
+        "地圖",
+        "timeline",
+        "比較圖",
+        "趨勢圖",
+    ]
+    return any(marker in text for marker in markers)
+
+
+def _compact_search_text_for_image_prompt(search_text: str, max_chars: int = 2200) -> str:
+    text = (search_text or "").strip()
+    if not text:
+        return ""
+    blocks = [block.strip() for block in re.split(r"\n(?=\[\d+\]\s)", text) if block.strip()]
+    compact = "\n\n".join(blocks[:3]).strip()
+    if len(compact) > max_chars:
+        compact = compact[:max_chars].rstrip() + "\n...[truncated]"
+    return compact
+
+
+async def _collect_web_evidence_for_image_request(
+    router: ModelRouter,
+    raw_messages: List[Any],
+    root_query: str,
+) -> tuple[str, List[str], List[Dict[str, Any]]]:
+    clean_query = _sanitize_search_query(root_query)
+    if not clean_query:
+        return "", [], []
+
+    planned_tasks = _llm_plan_web_search_tasks(router, raw_messages, clean_query)
+    if not planned_tasks:
+        planned_tasks = [{"query": clean_query, "need": "核心資料", "priority": 1}]
+
+    evidence_rows: List[str] = []
+    citations: List[str] = []
+    executed_tasks: List[Dict[str, Any]] = []
+
+    for idx, task in enumerate(planned_tasks[:3], 1):
+        task_need = str(task.get("need", "核心資料")).strip() or "核心資料"
+        task_query = _sanitize_search_query(str(task.get("query", "")))
+        if not task_query:
+            continue
+
+        task_result = await handle_call_tool("search_web", {"query": task_query, "max_results": 5})
+        task_text_parts: List[str] = []
+        for item in task_result:
+            text = getattr(item, "text", None)
+            if isinstance(text, str) and text.strip():
+                task_text_parts.append(text)
+        task_search_content = "\n\n".join(task_text_parts).strip()
+        if not task_search_content:
+            continue
+
+        compact = _compact_search_text_for_image_prompt(task_search_content)
+        if not compact:
+            continue
+
+        executed_tasks.append({"need": task_need, "query": task_query})
+        evidence_rows.append(f"[Task {idx}] need: {task_need}\nquery: {task_query}\n{compact}")
+        citations.extend(_extract_citations_from_content(task_search_content))
+
+    deduped: List[str] = []
+    seen = set()
+    for citation in citations:
+        normalized = citation.strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            deduped.append(normalized)
+
+    return "\n\n".join(evidence_rows).strip(), deduped, executed_tasks
+
+
+def _build_researched_image_prompt(user_prompt: str, evidence_text: str) -> str:
+    base_prompt = (user_prompt or "").strip()
+    if not evidence_text.strip():
+        return base_prompt
+    return (
+        f"{base_prompt}\n\n"
+        "This is a data-grounded image request. Use the retrieved evidence below to determine the entities, dates, labels, values, and trend direction. "
+        "Do not invent unsupported numbers or events. If some values are missing, keep the visual faithful to available evidence and avoid fabricated annotations.\n\n"
+        f"Retrieved evidence:\n{evidence_text}"
+    )
+
+
+async def _collect_search_evidence_for_queries(
+    queries: List[str],
+    *,
+    max_queries: int = 3,
+    max_results: int = 5,
+    max_chars_per_result: int = 3500,
+) -> tuple[str, List[str], List[str]]:
+    evidence_rows: List[str] = []
+    citations: List[str] = []
+    executed_queries: List[str] = []
+    seen_queries = set()
+
+    for query in queries:
+        normalized_query = _sanitize_search_query(query)
+        if not normalized_query or normalized_query in seen_queries:
+            continue
+        seen_queries.add(normalized_query)
+        if len(executed_queries) >= max_queries:
+            break
+
+        task_result = await handle_call_tool("search_web", {"query": normalized_query, "max_results": max_results})
+        task_text_parts: List[str] = []
+        for item in task_result:
+            text = getattr(item, "text", None)
+            if isinstance(text, str) and text.strip():
+                task_text_parts.append(text)
+
+        task_search_content = "\n\n".join(task_text_parts).strip()
+        if not task_search_content:
+            continue
+
+        executed_queries.append(normalized_query)
+        citations.extend(_extract_citations_from_content(task_search_content))
+        trimmed_content = task_search_content[:max_chars_per_result]
+        evidence_rows.append(
+            f"[Follow-up Query {len(executed_queries)}] {normalized_query}\nresult:\n{trimmed_content}"
+        )
+
+    deduped_citations: List[str] = []
+    seen_citations = set()
+    for citation in citations:
+        normalized = citation.strip()
+        if normalized and normalized not in seen_citations:
+            seen_citations.add(normalized)
+            deduped_citations.append(normalized)
+
+    return "\n\n".join(evidence_rows).strip(), deduped_citations, executed_queries
+
 # ── Helper Module Imports ──────────────────────────────────
 from app.search import (
     _sanitize_search_query,
@@ -275,7 +988,7 @@ from app.messages import (
     prune_messages,
     _estimate_messages_tokens,
 )
-from app.multimodal import prepare_multimodal_messages
+from app.multimodal import prepare_multimodal_messages, inject_payload_attachments
 from app.tools import (
     _is_openclaw_web_search,
     _extract_last_user_query,
@@ -291,6 +1004,8 @@ from app.tools import (
     _tool_label,
     _should_search,
     _llm_decide_web_search,
+    _llm_plan_web_search_tasks,
+    _llm_review_answer_completeness,
 )
 from app.response import build_chat_response, build_completion_response
 from app.schemas import (
@@ -300,6 +1015,7 @@ from app.schemas import (
     DirectQueryRequest,
     ChatCompletionResponse,
     FileContentRequest,
+    ImageGenerationRequest,
 )
 
 
@@ -316,6 +1032,7 @@ async def root():
         "endpoints": {
             "chat": "/v1/chat/completions",
             "completion": "/v1/completions",
+            "images": "/v1/images/generations",
             "models": "/v1/models",
             "health": "/health",
             "direct_query": "/v1/direct_query",
@@ -342,16 +1059,18 @@ async def list_models():
     for cat, providers in router._config_limits.items():
         for provider, models_dict in providers.items():
             for model_id, rpd in models_dict.items():
-                usage_key = router.get_usage_key(provider, model_id)
-                remaining = router._local_remaining_rpd.get(usage_key, rpd)
+                quota_summary = router.get_model_quota_summary(provider, model_id, rpd)
                 models.append({
                     "id": model_id,
                     "object": "model",
                     "created": 0,
                     "owned_by": provider,
                     "category": cat,
-                    "rpd_limit": rpd,
-                    "rpd_remaining": remaining,
+                    "rpd_limit": quota_summary["rpd_limit"],
+                    "rpd_remaining": quota_summary["rpd_remaining"],
+                    "provider_account_count": quota_summary["provider_account_count"],
+                    "provider_accounts": quota_summary["accounts"],
+                    "capabilities": router.get_model_capabilities(model_id),
                 })
     
     # 加入 auto 模型
@@ -421,10 +1140,28 @@ async def chat_completions(request: Request):
         model, stream, len(tools) if isinstance(tools, list) else 0, str(tool_choice)
     )
 
-    if not isinstance(raw_messages, list) or not raw_messages:
-        raise HTTPException(status_code=400, detail="messages must not be empty")
-
     router = get_router()
+
+    if isinstance(model, str) and model != "auto":
+        model_caps = router.get_model_capabilities(model)
+        if not model_caps.get("chat_capable", True):
+            task = model_caps.get("task", "chat")
+            if task == "image_generation":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"model {model} is image-generation only. Use /v1/images/generations",
+                )
+            raise HTTPException(
+                status_code=400,
+                detail=f"model {model} is not chat-capable (task={task})",
+            )
+
+    if not isinstance(raw_messages, list):
+        raise HTTPException(status_code=400, detail="messages must be a list")
+
+    raw_messages = inject_payload_attachments(raw_messages, raw)
+    if not raw_messages:
+        raise HTTPException(status_code=400, detail="messages must not be empty")
 
     try:
         raw_messages, multimodal_profile = prepare_multimodal_messages(raw_messages)
@@ -438,11 +1175,125 @@ async def chat_completions(request: Request):
         enable_memory = False
         logger.info("[Multimodal] attachments detected; memory injection disabled")
 
+    latest_user_text = str(multimodal_profile.get("latest_user_text", ""))
+    has_input_attachments = bool(
+        multimodal_profile.get("has_image_input") or multimodal_profile.get("has_file_input")
+    )
+
+    # ── Unified Gemma-3-27B Intent Classification ─────────
+    # Single call replaces separate check_need_image_generation +
+    # decide_multimodal_category + check_need_log_rag.
+    intent_result: Dict[str, Any] = {"intent": "text_chat", "multimodal_format": None, "reason": ""}
     if target_category is None:
-        decided_category = router.decide_multimodal_category(raw_messages, multimodal_profile)
-        if decided_category:
-            target_category = decided_category
-            logger.info("[Multimodal] target_category auto-selected: %s", decided_category)
+        intent_result = router.classify_intent(
+            user_message=latest_user_text,
+            has_image_input=bool(multimodal_profile.get("has_image_input")),
+            has_file_input=bool(multimodal_profile.get("has_file_input")),
+            file_kinds=list(multimodal_profile.get("file_kinds", [])),
+        )
+        logger.info(
+            "[IntentRouter] intent=%s multimodal_format=%s reason=%s",
+            intent_result["intent"], intent_result.get("multimodal_format"), intent_result.get("reason"),
+        )
+        if intent_result["intent"] == "multimodal":
+            target_category = "MultiModal"
+            logger.info("[IntentRouter] target_category → MultiModal")
+        elif intent_result["intent"] == "memory_query":
+            enable_memory = True
+            logger.info("[IntentRouter] intent=memory_query; forcing enable_memory=True")
+
+    # ── Image Generation ──────────────────────────────────
+    enable_auto_image_generation = bool(raw.get("enable_auto_image_generation", True))
+    if (
+        enable_auto_image_generation
+        and latest_user_text
+        and intent_result.get("intent") == "image_generation"
+    ):
+            image_prompt = latest_user_text
+            image_citations: List[str] = []
+            image_research_tasks: List[Dict[str, Any]] = []
+
+            if _is_data_backed_image_request(latest_user_text):
+                image_root_query = _sanitize_search_query(_extract_last_user_query(raw_messages))
+                if not image_root_query:
+                    image_root_query = _sanitize_search_query(latest_user_text)
+
+                llm_need_search, llm_image_query, _llm_image_alts = _llm_decide_web_search(
+                    router,
+                    raw_messages,
+                    image_root_query,
+                )
+                should_research_image = bool(image_root_query) and (
+                    llm_need_search is True or _is_data_backed_image_request(latest_user_text)
+                )
+
+                if should_research_image:
+                    image_query = llm_image_query or image_root_query
+                    try:
+                        evidence_text, image_citations, image_research_tasks = await _collect_web_evidence_for_image_request(
+                            router,
+                            raw_messages,
+                            image_query,
+                        )
+                        if evidence_text:
+                            image_prompt = _build_researched_image_prompt(latest_user_text, evidence_text)
+                            logger.info(
+                                "[AutoImage] research pipeline used; tasks=%d citations=%d",
+                                len(image_research_tasks),
+                                len(image_citations),
+                            )
+                    except Exception as image_search_exc:
+                        logger.warning("[AutoImage] research pipeline failed: %s", image_search_exc)
+
+            source_image_bytes = _extract_first_data_image_from_messages(raw_messages) if has_input_attachments else None
+            if source_image_bytes:
+                logger.info("[AutoImage] input image detected, attempting HF image-to-image generation")
+            else:
+                logger.info("[AutoImage] no source image found, using text-to-image generation")
+
+            image_model = str(raw.get("image_model") or "black-forest-labs/FLUX.1-schnell")
+            image_n = int(raw.get("image_n", 1) or 1)
+            image_size = str(raw.get("image_size") or "1024x1024")
+            image_response_format = str(raw.get("image_response_format") or "url")
+
+            image_result = _run_image_generation_with_router(
+                router,
+                prompt=image_prompt,
+                model=image_model,
+                n=image_n,
+                size=image_size,
+                response_format=image_response_format,
+                source_image_bytes=source_image_bytes,
+            )
+
+            if image_research_tasks:
+                lines = ["已先查找所需資料，再完成圖片生成："]
+            else:
+                lines = ["已自動判斷為圖片生成需求，已完成生成："]
+            for idx, item in enumerate(image_result.get("data", []), 1):
+                if item.get("url"):
+                    lines.append(f"[{idx}] {item['url']}")
+                elif item.get("b64_json"):
+                    lines.append(f"[{idx}] image base64 已回傳於 images[{idx - 1}].b64_json")
+                else:
+                    lines.append(f"[{idx}] image generated")
+
+            content = "\n".join(lines)
+            response_body = build_chat_response(
+                model=image_result.get("model", image_model),
+                content=content,
+                prompt_tokens=len(latest_user_text) // 4,
+                completion_tokens=len(content) // 4,
+            )
+            response_body["images"] = image_result.get("data", [])
+            response_body["provider"] = image_result.get("provider")
+            response_body["account_id"] = image_result.get("account_id")
+            response_body["quota"] = image_result.get("quota")
+            if image_citations:
+                response_body["citations"] = image_citations
+            if image_research_tasks:
+                response_body["research_tasks"] = image_research_tasks
+            return response_body
 
     # tool-calling shim：若宣告了 web_search tool，先回 tool_calls 讓 OpenClaw 觸發工具。
     raw_tools = raw.get("tools", [])
@@ -471,10 +1322,48 @@ async def chat_completions(request: Request):
         and not already_requested_in_turn
     ):
         query = _sanitize_search_query(_extract_last_user_query(raw_messages))
+
+        # Build a better seed query for attachment-centric requests.
+        attachment_name_hints: List[str] = []
+        for message in raw_messages:
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            content = message.get("content", "")
+            text = normalize_content(content)
+            for match in re.findall(r"(?im)^name:\s*(.+)$", text):
+                hint = str(match).strip()
+                if hint:
+                    attachment_name_hints.append(hint)
+
+        if attachment_name_hints:
+            hint_text = " ".join(attachment_name_hints[:2])
+            if not query or re.search(r"[0-9a-f]{8}-[0-9a-f-]{27,}\.pdf$", query, re.IGNORECASE):
+                query = _sanitize_search_query(f"{latest_user_text} {hint_text}")
+
         llm_use_search, llm_query, llm_alternates = _llm_decide_web_search(router, raw_messages, query)
         should_search = llm_use_search if llm_use_search is not None else _should_search(query, tool_choice, raw_messages)
+
+        # Force search for common paper-summary requests with file attachments.
+        paper_request_re = re.compile(
+            r"(論文|paper|arxiv|summary|summarize|摘要|demo\s*code|程式碼|實作)",
+            re.IGNORECASE,
+        )
+        force_search = bool(
+            multimodal_profile.get("has_file_input")
+            and (
+                "pdf" in list(multimodal_profile.get("file_kinds", []))
+                or paper_request_re.search(latest_user_text or "")
+            )
+        )
+        if force_search and not should_search:
+            should_search = True
+            logger.info("[ToolShim] force_search enabled for attachment-based paper request")
+
         if should_search and llm_query:
             query = llm_query
+        if should_search and not query and latest_user_text:
+            query = _sanitize_search_query(latest_user_text)
+
         tool_name = _pick_web_search_tool_name(raw_tools)
         logger.info(
             "[ToolShim] web-search tool detected; should_search=%s; llm_decision=%s; tool_choice=%s; query_preview=%s; selected_tool=%s; tool_labels=%s",
@@ -493,21 +1382,42 @@ async def chat_completions(request: Request):
                 # Fall through to normal model response path.
                 pass
             else:
+                planned_tasks = _llm_plan_web_search_tasks(router, raw_messages, query)
+                if not planned_tasks:
+                    planned_tasks = [{"query": query, "need": "核心資訊", "priority": 1}]
+
                 model_used = str(raw.get("model", "auto"))
                 request_id = f"chatcmpl-{int(time.time())}"
                 created_ts = int(time.time())
-                tool_call = {
-                    "id": "call_web_search_1",
-                    "type": "function",
-                    "function": {
-                        "name": tool_name,
-                        "arguments": json.dumps({"query": query, "count": 5}),
-                    },
-                }
-                stream_tool_call = {
-                    "index": 0,
-                    **tool_call,
-                }
+                tool_calls = []
+                stream_tool_calls = []
+                for idx, task in enumerate(planned_tasks, 1):
+                    task_query = _sanitize_search_query(str(task.get("query", "")))
+                    if not task_query:
+                        continue
+                    tool_call = {
+                        "id": f"call_web_search_{idx}",
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": json.dumps({"query": task_query, "count": 5}),
+                        },
+                    }
+                    tool_calls.append(tool_call)
+                    stream_tool_calls.append({"index": idx - 1, **tool_call})
+
+                if not tool_calls:
+                    tool_calls = [{
+                        "id": "call_web_search_1",
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": json.dumps({"query": query, "count": 5}),
+                        },
+                    }]
+                    stream_tool_calls = [{"index": 0, **tool_calls[0]}]
+
+                logger.info("[ToolShim] emitting %d planned web_search tool calls", len(tool_calls))
 
                 if stream:
                     def sse_tool_call_generator():
@@ -520,7 +1430,7 @@ async def chat_completions(request: Request):
                                 "index": 0,
                                 "delta": {
                                     "role": "assistant",
-                                    "tool_calls": [stream_tool_call],
+                                    "tool_calls": stream_tool_calls,
                                 },
                                 "finish_reason": None,
                             }],
@@ -553,7 +1463,7 @@ async def chat_completions(request: Request):
                         "index": 0,
                         "message": {
                             "role": "assistant",
-                            "tool_calls": [tool_call],
+                            "tool_calls": tool_calls,
                         },
                         "finish_reason": "tool_calls",
                     }],
@@ -583,8 +1493,10 @@ async def chat_completions(request: Request):
                 text_parts.append(text)
 
         content = "\n\n".join(text_parts).strip() or "No search results"
+        user_hint = _extract_last_user_query(raw_messages)
+        content = _postprocess_user_response(user_hint, content)
         citations = _extract_citations_from_content(content)
-        model_used = str(raw.get("model", "perplexity/sonar-pro"))
+        model_used = str(raw.get("model", "model_router/DDGS"))
 
         return {
             "id": f"chatcmpl-{int(time.time())}",
@@ -632,6 +1544,7 @@ async def chat_completions(request: Request):
 
     # post-tool 回合：清理工具輸出格式，讓 LLM 能順利基於結果作答。
     post_tool_citations: List[str] = []
+    post_tool_evidence_summary = ""
     if _last_message_is_tool_result(raw_messages):
         user_query_hint = _sanitize_search_query(_extract_last_user_query(raw_messages))
         last_msg = raw_messages[-1]
@@ -643,16 +1556,32 @@ async def chat_completions(request: Request):
             if clean_content and clean_content != raw_tool_content:
                 logger.info("[ToolShim] Extracted clean tool content (%d chars)", len(clean_content))
                 last_msg["content"] = clean_content
+            post_tool_evidence_summary = clean_content[:9000]
             logger.info("[ToolShim] tool_text_preview=%s", clean_content[:200])
 
         # 強制約束 LLM 必須基於工具輸出作答（泛用，不限天氣）
         references_text = "\n".join(
             f"[{i}] {url}" for i, url in enumerate(post_tool_citations[:8], 1)
         )
+        references_rule = (
+            "在答案最後必須加上『參考來源』段落，逐條列出來源 URL。"
+            "若有可用來源，內文關鍵句請以 [1]、[2] 這種格式標註。"
+        ) if post_tool_citations else (
+            "若當前工具輸出沒有可用 URL，請直接給出精簡結論，不要加入『無來源 URL』類型聲明。"
+        )
+        code_rule = (
+            "此題為程式碼需求：請直接提供完整、可執行的程式碼實作（不要只給片段或概念摘要）。"
+            "先給完整程式碼區塊，再用精簡條列說明設計重點與複雜度。"
+            "若需求含多個功能（例如加減乘除），需在同一份程式中完整實作。"
+            "必須包含 main()；必須附至少 2 組測資；必須列出時間複雜度與邊界條件。"
+        ) if _is_code_generation_request(latest_user_text) else ""
         raw_messages.append({
             "role": "system",
             "content": (
                 "你必須根據上方工具回傳的搜尋結果作答，整合資訊後給出清楚的中文回覆。"
+                "若使用中文，必須使用繁體中文（zh-TW），禁止簡體中文。"
+                f"{_research_answer_style_instruction()}"
+                "回覆需先給結論，再補上必要重點（通常 3-6 點）；可略詳細，但避免無關資訊。"
                 "禁止說你無法上網、無法查詢即時資訊或要求使用者自行查詢。"
                 "若搜尋結果與問題無關，請誠實說明並建議使用者換個關鍵字重試。"
                 "若同名詞對應多個實體，且使用者未要求比較，先回答最可能的單一目標，不要平均分配篇幅。"
@@ -661,13 +1590,119 @@ async def chat_completions(request: Request):
                 "不得捏造來源未提供的細節；每個關鍵事實必須可由來源支持。"
                 "若仍無法回答精確數值，必須明確指出『缺少的欄位是什麼』（例如：缺昨日收盤欄位/缺結算價欄位），"
                 "並指出最接近的已取得數據及其來源，不可只給泛泛道歉。"
-                "在答案最後必須加上『參考來源』段落，逐條列出來源 URL。"
-                "若有可用來源，內文關鍵句請以 [1]、[2] 這種格式標註。"
+                f"{code_rule}"
+                f"{references_rule}"
                 f"\n使用者問題：{user_query_hint or '(unknown)'}"
                 f"\n可用來源如下：\n{references_text if references_text else '(目前無可用來源 URL，請明確說明)'}"
             ),
         })
         logger.info("[ToolShim] post-tool: cleaned content + system constraint added; routing to LLM for synthesis")
+
+    # ── Proactive Auto Web Search ─────────────────────────
+    # Multi-step pipeline:
+    # 1) decide whether search is needed,
+    # 2) plan information requirements as a task table,
+    # 3) execute web_search task-by-task,
+    # 4) inject gathered evidence for final synthesis.
+    auto_search_citations: List[str] = []
+    auto_search_evidence_summary = ""
+    if (
+        not has_web_tool
+        and not last_is_tool
+        and not _last_message_is_tool_result(raw_messages)
+        and intent_result.get("intent") not in {"image_generation", "multimodal"}
+        and not _is_openclaw_web_search(raw, request)
+        and latest_user_text
+    ):
+        auto_query = _sanitize_search_query(_extract_last_user_query(raw_messages))
+        if auto_query:
+            llm_need_search, llm_auto_query, _llm_alts = _llm_decide_web_search(router, raw_messages, auto_query)
+            if llm_need_search is True:
+                final_auto_query = llm_auto_query or auto_query
+                logger.info("[AutoSearch] proactive search triggered; root_query=%s", final_auto_query)
+                try:
+                    search_tasks = _llm_plan_web_search_tasks(router, raw_messages, final_auto_query)
+                    if not search_tasks:
+                        search_tasks = [{
+                            "need": "回答問題所需的核心外部資訊",
+                            "query": final_auto_query,
+                            "why": "fallback",
+                            "priority": 1,
+                        }]
+
+                    gathered_rows: List[str] = []
+                    information_rows: List[str] = []
+                    for idx, task in enumerate(search_tasks, 1):
+                        task_need = str(task.get("need", "未命名資訊需求"))
+                        task_query = _sanitize_search_query(str(task.get("query", "")))
+                        task_why = str(task.get("why", ""))
+                        if not task_query:
+                            continue
+
+                        information_rows.append(
+                            f"{idx}. need={task_need} | query={task_query} | why={task_why or 'n/a'}"
+                        )
+                        logger.info("[AutoSearch] task %d/%d query=%s", idx, len(search_tasks), task_query)
+
+                        task_result = await handle_call_tool(
+                            "search_web", {"query": task_query, "max_results": 5}
+                        )
+                        task_text_parts: List[str] = []
+                        for item in task_result:
+                            text = getattr(item, "text", None)
+                            if isinstance(text, str) and text.strip():
+                                task_text_parts.append(text)
+                        task_search_content = "\n\n".join(task_text_parts).strip()
+                        if not task_search_content:
+                            continue
+
+                        auto_search_citations.extend(_extract_citations_from_content(task_search_content))
+                        gathered_rows.append(
+                            f"[Task {idx}] need: {task_need}\n"
+                            f"query: {task_query}\n"
+                            f"result:\n{task_search_content[:4500]}"
+                        )
+
+                    # Deduplicate citations while preserving order.
+                    deduped_citations: List[str] = []
+                    seen_citations = set()
+                    for c in auto_search_citations:
+                        normalized = c.strip()
+                        if not normalized or normalized in seen_citations:
+                            continue
+                        seen_citations.add(normalized)
+                        deduped_citations.append(normalized)
+                    auto_search_citations = deduped_citations
+
+                    references_text = "\n".join(
+                        f"[{i}] {url}" for i, url in enumerate(auto_search_citations[:12], 1)
+                    )
+                    gathered_text = "\n\n".join(gathered_rows).strip()
+                    if gathered_text:
+                        auto_search_evidence_summary = gathered_text[:12000]
+                        information_table = "\n".join(information_rows) if information_rows else "(無)"
+                        raw_messages.append({
+                            "role": "system",
+                            "content": (
+                                "以下是系統自動搜尋管線的輸出，請根據這些資料回答使用者問題。\n"
+                                "流程已完成：需求拆解 -> 逐項搜尋 -> 資料彙整。\n"
+                                f"{_research_answer_style_instruction()}\n"
+                                f"原始問題：{auto_query}\n\n"
+                                f"資訊需求表：\n{information_table}\n\n"
+                                f"資料列表：\n{gathered_text}\n\n"
+                                f"可用來源：\n{references_text if references_text else '(無)'}\n\n"
+                                "不得捏造來源未提供的細節；每個關鍵事實必須可由來源支持。\n"
+                                "在答案最後必須加上『參考來源』段落，逐條列出來源 URL。\n"
+                                "若有可用來源，內文關鍵句請以 [1]、[2] 格式標註。\n"
+                            ),
+                        })
+                        logger.info(
+                            "[AutoSearch] injected planned evidence: tasks=%d gathered_chars=%d",
+                            len(search_tasks),
+                            len(gathered_text),
+                        )
+                except Exception as auto_exc:
+                    logger.warning("[AutoSearch] search_web failed: %s", auto_exc)
 
     # ── has_tools 判斷 ──────────────────────────────────────
     has_tools = isinstance(tools, list) and len(tools) > 0
@@ -689,7 +1724,7 @@ async def chat_completions(request: Request):
         messages = prune_messages(
             messages,
             max_input_tokens=2800,
-            keep_last=5,
+            keep_last=8,
             max_chars_per_message=2000,
         )
     else:
@@ -702,6 +1737,11 @@ async def chat_completions(request: Request):
 
     est_tokens = _estimate_messages_tokens(messages)
     logger.info("[Prune] has_tools=%s, messages=%d, est_tokens=%d", has_tools, len(messages), est_tokens)
+
+    # Safety guard for Google OpenAI-compatible endpoint: keep at least one user content turn.
+    messages = _ensure_user_message_for_generation(messages, latest_user_text)
+    messages = _sanitize_messages_for_model(messages)
+    messages = _ensure_user_message_for_generation(messages, latest_user_text)
 
     # ── 決定 target_category ─────────────────────────────
     model_name = model.lower() if isinstance(model, str) else "auto"
@@ -751,6 +1791,11 @@ async def chat_completions(request: Request):
             else:
                 logger.info("[Memory] 記憶功能已停用，使用原始方法")
 
+        # ── Per-prompt identity prefix + system identity ──
+        messages = _prepend_identity_prefix_to_messages(messages)
+        messages = _inject_agent_system_prompt(messages)
+        messages = _append_code_output_requirements(messages, latest_user_text)
+
         # 目前先不真正把 tools 傳下去，只做兼容吸收
         response = router.chat(
             messages=messages,
@@ -765,6 +1810,60 @@ async def chat_completions(request: Request):
             content = response.choices[0].message.content or ""
         if hasattr(response, "model"):
             model_used = response.model
+
+        review_evidence_summary = auto_search_evidence_summary or post_tool_evidence_summary
+        if latest_user_text and review_evidence_summary and intent_result.get("intent") == "text_chat":
+            review_result = _llm_review_answer_completeness(
+                router,
+                latest_user_text,
+                content,
+                review_evidence_summary,
+            )
+            if not review_result.get("is_complete", True):
+                next_queries = [q for q in review_result.get("next_queries", []) if isinstance(q, str) and q.strip()]
+                if next_queries:
+                    logger.info(
+                        "[AnswerReview] incomplete answer detected; reason=%s; next_queries=%s",
+                        review_result.get("reason", ""),
+                        next_queries,
+                    )
+                    try:
+                        followup_evidence, followup_citations, executed_queries = await _collect_search_evidence_for_queries(next_queries)
+                        if followup_evidence:
+                            followup_references = "\n".join(
+                                f"[{i}] {url}" for i, url in enumerate(followup_citations[:8], 1)
+                            )
+                            retry_messages = list(messages) + [{
+                                "role": "system",
+                                "content": (
+                                    "回答品質審核器判定前一版答案仍有缺漏，請根據以下補充查詢結果重新整理答案。"
+                                    f"缺漏重點：{'; '.join(review_result.get('missing', [])[:4]) or '請補足遺漏資訊'}\n"
+                                    f"補充查詢：{', '.join(executed_queries)}\n\n"
+                                    f"補充證據：\n{followup_evidence}\n\n"
+                                    f"補充來源：\n{followup_references if followup_references else '(無)'}\n"
+                                    "請輸出更完整的最終答案，但仍需保持聚焦，避免重複。"
+                                ),
+                            }]
+                            retry_response = router.chat(
+                                messages=retry_messages,
+                                target_category=target_category,
+                                include_chat_only=True,
+                                **kwargs
+                            )
+                            if retry_response.choices and retry_response.choices[0].message:
+                                content = retry_response.choices[0].message.content or content
+                            if hasattr(retry_response, "model"):
+                                model_used = retry_response.model
+
+                            review_evidence_summary = f"{review_evidence_summary}\n\n{followup_evidence}"[:12000]
+                            for citation in followup_citations:
+                                if citation not in auto_search_citations:
+                                    auto_search_citations.append(citation)
+                            logger.info("[AnswerReview] follow-up search completed; regenerated final answer")
+                    except Exception as review_exc:
+                        logger.warning("[AnswerReview] follow-up search/regeneration failed: %s", review_exc)
+
+        content = _postprocess_user_response(latest_user_text, content)
 
         if enable_memory and original_user_message and content:
             router.add_to_history(original_user_message, content)
@@ -821,6 +1920,8 @@ async def chat_completions(request: Request):
         )
         if post_tool_citations:
             response_body["citations"] = post_tool_citations
+        if auto_search_citations and not post_tool_citations:
+            response_body["citations"] = auto_search_citations
         return response_body
 
     except RuntimeError as e:
@@ -848,8 +1949,10 @@ async def completions(request: CompletionRequest):
     
     router = get_router()
     
-    # 轉換為 chat 格式
-    messages = [{"role": "user", "content": request.prompt}]
+    # 轉換為 chat 格式（每個 prompt 前加身份前綴）
+    messages = [{"role": "user", "content": _wrap_identity_question(request.prompt)}]
+    messages = _inject_agent_system_prompt(messages)
+    messages = _append_code_output_requirements(messages, request.prompt)
     
     try:
         kwargs = {}
@@ -914,6 +2017,7 @@ async def admin_status():
     status = {
         "priority_flags": router.priority_flags,
         "quotas": {},
+        "internal_usage": router.get_internal_usage_stats(),
     }
     
     for cat, providers in router._config_limits.items():
@@ -921,12 +2025,16 @@ async def admin_status():
         for provider, models_dict in providers.items():
             status["quotas"][cat][provider] = {}
             for model_id, rpd_limit in models_dict.items():
-                usage_key = router.get_usage_key(provider, model_id)
-                remaining = router._local_remaining_rpd.get(usage_key, rpd_limit)
+                quota_summary = router.get_model_quota_summary(provider, model_id, rpd_limit)
                 status["quotas"][cat][provider][model_id] = {
-                    "limit": rpd_limit,
-                    "remaining": remaining,
-                    "used": rpd_limit - remaining if rpd_limit != -1 else 0,
+                    "limit": quota_summary["rpd_limit"],
+                    "remaining": quota_summary["rpd_remaining"],
+                    "used": (
+                        0
+                        if quota_summary["rpd_limit"] == -1 or quota_summary["rpd_remaining"] == -1
+                        else max(quota_summary["rpd_limit"] - quota_summary["rpd_remaining"], 0)
+                    ),
+                    "accounts": quota_summary["accounts"],
                 }
     
     return status
@@ -1016,14 +2124,16 @@ async def direct_query(request: DirectQueryRequest):
     
     # 驗證 provider
     provider_lower = request.provider.lower()
-    if provider_lower not in ["github", "google", "ollama"]:
+    if provider_lower not in ["github", "google", "ollama", "huggingface"]:
         raise HTTPException(
             status_code=400, 
-            detail=f"不支持的 provider: {request.provider}。支持的 provider: GitHub, Google, Ollama"
+            detail=f"不支持的 provider: {request.provider}。支持的 provider: GitHub, Google, Ollama, HuggingFace"
         )
     
-    # 轉換為 chat 格式
-    messages = [{"role": "user", "content": request.prompt}]
+    # 轉換為 chat 格式（每個 prompt 前加身份前綴）
+    messages = [{"role": "user", "content": _wrap_identity_question(request.prompt)}]
+    messages = _inject_agent_system_prompt(messages)
+    messages = _append_code_output_requirements(messages, request.prompt)
     
     try:
         # 準備參數
@@ -1036,19 +2146,58 @@ async def direct_query(request: DirectQueryRequest):
         # 根據模型調整參數
         prepared_kwargs = router._prepare_kwargs(request.model_name, kwargs)
         
-        # 獲取對應的 client
-        client = getattr(router, provider_lower)
-        
-        # 記錄調用
-        logger.info(f"[Direct Query] Provider: {request.provider} | Model: {request.model_name} | Prompt: {request.prompt[:50]}...")
-        
-        # 直接調用模型（帶重試）
-        response = router._call_with_retry(
-            client=client,
-            model_id=request.model_name,
-            messages=messages,
-            **prepared_kwargs
-        )
+        if provider_lower == "github":
+            provider_name = "GitHub"
+        elif provider_lower == "huggingface":
+            provider_name = "HuggingFace"
+        else:
+            provider_name = request.provider.capitalize()
+        accounts = router._get_provider_accounts(provider_name)
+        if not accounts:
+            raise HTTPException(status_code=500, detail=f"{request.provider} 沒有可用帳戶")
+
+        response = None
+        selected_account = "default"
+        for account in accounts:
+            account_id = account.get("id", "default")
+            usage_key = router.get_usage_key(provider_name, request.model_name, account_id)
+            remaining = router._get_remaining_quota(usage_key)
+            if remaining == 0:
+                continue
+
+            client = router._get_client(provider_name, account_id)
+
+            logger.info(
+                "[Direct Query] Provider: %s | Account: %s | Model: %s | Prompt: %s...",
+                request.provider,
+                account_id,
+                request.model_name,
+                request.prompt[:50],
+            )
+
+            try:
+                response = router._call_with_retry(
+                    client=client,
+                    model_id=request.model_name,
+                    messages=messages,
+                    **prepared_kwargs
+                )
+                router._decrement_quota(usage_key)
+                selected_account = account_id
+                break
+            except Exception as exc:
+                if "rate" in str(exc).lower() or "quota" in str(exc).lower():
+                    router._mark_quota_exhausted(usage_key)
+                logger.warning(
+                    "[Direct Query] Provider: %s | Account: %s failed: %s",
+                    request.provider,
+                    account_id,
+                    exc,
+                )
+                continue
+
+        if response is None:
+            raise HTTPException(status_code=503, detail=f"{request.provider} 所有帳戶目前都不可用或配額已滿")
         
         # 提取回答
         content = ""
@@ -1070,12 +2219,15 @@ async def direct_query(request: DirectQueryRequest):
         
         logger.info(f"[Direct Query Success] Model: {request.model_name} | Answer: {content[:100]}...")
         
-        return build_chat_response(
+        response_body = build_chat_response(
             model=request.model_name,
             content=content,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
         )
+        response_body["provider"] = provider_name
+        response_body["account_id"] = selected_account
+        return response_body
         
     except HTTPException:
         # 重新拋出 HTTP 異常
@@ -1096,6 +2248,30 @@ async def direct_query(request: DirectQueryRequest):
             detail_msg = f"調用模型 {request.model_name} 失敗: {error_msg}"
         
         raise HTTPException(status_code=500, detail=detail_msg)
+
+
+@app.post("/v1/images/generations")
+async def image_generations(request: ImageGenerationRequest):
+    """OpenAI-compatible image generation endpoint backed by Google Imagen models."""
+    router = get_router()
+
+    prompt = (request.prompt or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="prompt must not be empty")
+
+    model = request.model or "black-forest-labs/FLUX.1-schnell"
+    caps = router.get_model_capabilities(model)
+    if caps.get("task") != "image_generation":
+        raise HTTPException(status_code=400, detail=f"model {model} is not an image generation model")
+
+    return _run_image_generation_with_router(
+        router,
+        prompt=prompt,
+        model=model,
+        n=int(request.n or 1),
+        size=str(request.size or "1024x1024"),
+        response_format=str(request.response_format or "b64_json"),
+    )
 
 
 @app.post("/v1/file/generate_content")
@@ -1130,6 +2306,11 @@ async def file_generate_content(
         raise HTTPException(
             status_code=503,
             detail="GOOGLE_API_KEY 未設定，無法使用文件上傳功能"
+        )
+    if genai is None:
+        raise HTTPException(
+            status_code=503,
+            detail="google-generativeai 套件未安裝，無法使用文件上傳功能"
         )
     
     # 固定使用 gemma-3-12b-it 模型
@@ -1171,8 +2352,9 @@ async def file_generate_content(
         logger.info(f"[File Generate] 使用模型 {model_name} 生成內容...")
         logger.info(f"[File Generate] Prompt: {prompt[:100]}...")
         
+        wrapped_prompt = _wrap_identity_question(prompt)
         response = model.generate_content(
-            [uploaded_file, prompt],
+            [uploaded_file, wrapped_prompt],
             generation_config=generation_config  # type: ignore[arg-type]
         )
         
