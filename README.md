@@ -30,8 +30,6 @@
 
 ✅ **答案完整性審核回圈** - 第一版回答完成後，Gemma reviewer 可自動判斷缺漏並補查一次再重寫
 
-✅ **資料驅動圖片生成** - K 線圖、趨勢圖、dashboard、infographic 類需求會先查資料，再把 evidence 注入圖片 prompt
-
 ✅ **程式碼輸出強制標準** - 程式碼任務預設要求完整可執行實作、`main()`、至少 2 組測資、複雜度與邊界條件
 
 ✅ **內部 Gemma 用量可視化** - Dashboard 可直接看到 classifier / planner / reviewer 等內部 helper 呼叫次數
