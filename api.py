@@ -344,12 +344,11 @@ def _append_code_output_requirements(messages: List[Dict[str, Any]], user_text: 
 def _research_answer_style_instruction() -> str:
     return (
         "若本題有使用搜尋、工具或外部資料，回答格式請遵守："
-        "先用 1 至 2 句簡短對齊使用者情境與你採用的做法，例如『收到，你是用這個 fork，我改成直接對著這個 repo 看』。"
-        "接著可加一個很短的『活動』區塊，列出 3 至 5 個已執行的工作摘要，例如查了哪些文件、找了哪些設定、核對了哪些流程；"
-        "這是對外可見的工作摘要，不是逐字思考過程。"
+        "先用 1 至 2 句簡短對齊使用者情境與你採用的做法，例如『收到，我直接對著這個 repo 與相關公開資料核對』。"
         "之後直接給答案、步驟、設定片段與注意事項。"
+        "若真的有幫助，才可加入很短的工作摘要；不可為了湊格式而輸出空泛或奇怪的條列。"
         "禁止輸出『正在思考』、『我先想一下』這類內部推理字樣；"
-        "若要描述流程，請改寫成已完成或正在進行的工作摘要。"
+        "若要描述流程，請改寫成已完成的工作摘要，且每一點都必須具體。"
     )
 
 
@@ -1271,10 +1270,13 @@ async def chat_completions(request: Request):
             else:
                 lines = ["已自動判斷為圖片生成需求，已完成生成："]
             for idx, item in enumerate(image_result.get("data", []), 1):
-                if item.get("url"):
+                image_url = str(item.get("url") or "")
+                if image_url and image_url.startswith("data:image"):
+                    lines.append(f"[{idx}] 圖片已生成，內容請查看下方圖片預覽")
+                elif item.get("url"):
                     lines.append(f"[{idx}] {item['url']}")
                 elif item.get("b64_json"):
-                    lines.append(f"[{idx}] image base64 已回傳於 images[{idx - 1}].b64_json")
+                    lines.append(f"[{idx}] 圖片已生成，內容請查看下方圖片預覽")
                 else:
                     lines.append(f"[{idx}] image generated")
 
@@ -1806,6 +1808,7 @@ async def chat_completions(request: Request):
 
         content = ""
         model_used = model
+        final_generation_messages = list(messages)
         if response.choices and response.choices[0].message:
             content = response.choices[0].message.content or ""
         if hasattr(response, "model"):
@@ -1813,55 +1816,99 @@ async def chat_completions(request: Request):
 
         review_evidence_summary = auto_search_evidence_summary or post_tool_evidence_summary
         if latest_user_text and review_evidence_summary and intent_result.get("intent") == "text_chat":
-            review_result = _llm_review_answer_completeness(
-                router,
-                latest_user_text,
-                content,
-                review_evidence_summary,
-            )
-            if not review_result.get("is_complete", True):
-                next_queries = [q for q in review_result.get("next_queries", []) if isinstance(q, str) and q.strip()]
-                if next_queries:
-                    logger.info(
-                        "[AnswerReview] incomplete answer detected; reason=%s; next_queries=%s",
-                        review_result.get("reason", ""),
-                        next_queries,
-                    )
-                    try:
-                        followup_evidence, followup_citations, executed_queries = await _collect_search_evidence_for_queries(next_queries)
-                        if followup_evidence:
-                            followup_references = "\n".join(
-                                f"[{i}] {url}" for i, url in enumerate(followup_citations[:8], 1)
-                            )
-                            retry_messages = list(messages) + [{
-                                "role": "system",
-                                "content": (
-                                    "回答品質審核器判定前一版答案仍有缺漏，請根據以下補充查詢結果重新整理答案。"
-                                    f"缺漏重點：{'; '.join(review_result.get('missing', [])[:4]) or '請補足遺漏資訊'}\n"
-                                    f"補充查詢：{', '.join(executed_queries)}\n\n"
-                                    f"補充證據：\n{followup_evidence}\n\n"
-                                    f"補充來源：\n{followup_references if followup_references else '(無)'}\n"
-                                    "請輸出更完整的最終答案，但仍需保持聚焦，避免重複。"
-                                ),
-                            }]
-                            retry_response = router.chat(
-                                messages=retry_messages,
-                                target_category=target_category,
-                                include_chat_only=True,
-                                **kwargs
-                            )
-                            if retry_response.choices and retry_response.choices[0].message:
-                                content = retry_response.choices[0].message.content or content
-                            if hasattr(retry_response, "model"):
-                                model_used = retry_response.model
+            max_review_iterations = int(raw.get("max_review_iterations", 3) or 3)
+            max_review_iterations = max(1, min(max_review_iterations, 6))
 
-                            review_evidence_summary = f"{review_evidence_summary}\n\n{followup_evidence}"[:12000]
-                            for citation in followup_citations:
-                                if citation not in auto_search_citations:
-                                    auto_search_citations.append(citation)
-                            logger.info("[AnswerReview] follow-up search completed; regenerated final answer")
-                    except Exception as review_exc:
-                        logger.warning("[AnswerReview] follow-up search/regeneration failed: %s", review_exc)
+            for review_round in range(1, max_review_iterations + 1):
+                review_result = _llm_review_answer_completeness(
+                    router,
+                    latest_user_text,
+                    content,
+                    review_evidence_summary,
+                )
+                if review_result.get("is_complete", True):
+                    logger.info("[AnswerReview] round=%d passed", review_round)
+                    break
+
+                next_queries = [q for q in review_result.get("next_queries", []) if isinstance(q, str) and q.strip()]
+                if not next_queries:
+                    logger.info("[AnswerReview] round=%d incomplete but no next_queries; stop", review_round)
+                    break
+
+                logger.info(
+                    "[AnswerReview] round=%d incomplete; reason=%s; next_queries=%s",
+                    review_round,
+                    review_result.get("reason", ""),
+                    next_queries,
+                )
+
+                try:
+                    followup_evidence, followup_citations, executed_queries = await _collect_search_evidence_for_queries(next_queries)
+                    if not followup_evidence:
+                        logger.info("[AnswerReview] round=%d follow-up evidence empty; stop", review_round)
+                        break
+
+                    followup_references = "\n".join(
+                        f"[{i}] {url}" for i, url in enumerate(followup_citations[:8], 1)
+                    )
+                    review_feedback = (
+                        f"審核不通過原因：{review_result.get('reason', '未提供')}\n"
+                        f"缺漏重點：{'; '.join(review_result.get('missing', [])[:4]) or '請補足遺漏資訊'}\n"
+                        f"補充查詢：{', '.join(executed_queries)}"
+                    )
+
+                    # Re-run intent classification with review feedback as additional context.
+                    feedback_intent_input = f"{latest_user_text}\n\n[REVIEW_FEEDBACK]\n{review_feedback}"
+                    retry_intent = router.classify_intent(
+                        user_message=feedback_intent_input,
+                        has_image_input=bool(multimodal_profile.get("has_image_input")),
+                        has_file_input=bool(multimodal_profile.get("has_file_input")),
+                        file_kinds=list(multimodal_profile.get("file_kinds", [])),
+                    )
+
+                    retry_target_category = target_category
+                    if retry_intent.get("intent") == "multimodal":
+                        retry_target_category = "MultiModal"
+                    elif retry_intent.get("intent") == "text_chat":
+                        retry_target_category = target_category or "TextOnlyHigh"
+
+                    retry_messages = list(messages) + [{
+                        "role": "system",
+                        "content": (
+                            f"第 {review_round} 輪審核未通過，請根據以下資訊重寫答案。\n"
+                            f"{review_feedback}\n\n"
+                            f"補充證據：\n{followup_evidence}\n\n"
+                            f"補充來源：\n{followup_references if followup_references else '(無)'}\n"
+                            "請輸出更完整且直接可用的最終答案，避免重複或空泛描述。"
+                        ),
+                    }]
+
+                    retry_response = router.chat(
+                        messages=retry_messages,
+                        target_category=retry_target_category,
+                        include_chat_only=True,
+                        **kwargs
+                    )
+                    if retry_response.choices and retry_response.choices[0].message:
+                        content = retry_response.choices[0].message.content or content
+                    if hasattr(retry_response, "model"):
+                        model_used = retry_response.model
+
+                    final_generation_messages = retry_messages
+                    review_evidence_summary = f"{review_evidence_summary}\n\n{followup_evidence}"[:12000]
+                    for citation in followup_citations:
+                        if citation not in auto_search_citations:
+                            auto_search_citations.append(citation)
+
+                    logger.info(
+                        "[AnswerReview] round=%d regenerated; retry_intent=%s retry_target=%s",
+                        review_round,
+                        retry_intent.get("intent"),
+                        retry_target_category,
+                    )
+                except Exception as review_exc:
+                    logger.warning("[AnswerReview] round=%d failed: %s", review_round, review_exc)
+                    break
 
         content = _postprocess_user_response(latest_user_text, content)
 
@@ -1869,7 +1916,7 @@ async def chat_completions(request: Request):
             router.add_to_history(original_user_message, content)
             logger.info("[Memory] 已將對話添加到歷史記錄")
 
-        prompt_tokens = sum(len(m["content"]) // 4 for m in messages)
+        prompt_tokens = sum(len(m["content"]) // 4 for m in final_generation_messages)
         completion_tokens = len(content) // 4
 
         if stream:

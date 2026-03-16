@@ -163,6 +163,7 @@ class ModelRouter:
             "gemma_intent_classifier_calls": 0,
             "gemma_memory_classifier_calls": 0,
             "gemma_image_classifier_calls": 0,
+            "gemma_search_decider_calls": 0,
             "gemma_search_planner_calls": 0,
             "gemma_answer_reviewer_calls": 0,
         }

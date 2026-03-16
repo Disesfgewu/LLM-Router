@@ -1,51 +1,36 @@
 # ModelRouter API Gateway
 
-多模型智慧路由 API 閘道，對外提供 OpenAI 相容介面，自動在 GitHub Models、Google Gemini、Ollama 之間做 failover 和配額管理。
+這是一個以 FastAPI 為核心的多模型 API gateway，提供 OpenAI 相容介面，並在 GitHub Models、Google、Ollama、HuggingFace 之間做路由、配額追蹤與部分失敗切換。
 
-## 功能特色
+目前專案重點放在三件事：
 
-✅ **多提供者路由** - 自動在 GitHub Models、Google Gemini、Ollama 切換
+- 用單一 API 入口包住多個模型提供者
+- 讓常見聊天、檔案輸入、圖片生成與管理查詢可以共用同一套服務
+- 保留實驗性搜尋與研究流程，但不把它描述成已完全穩定
 
-✅ **智慧 Failover** - 一個模型失敗或額度滿，自動切換下一個
+## 目前可確認的能力
 
-✅ **配額管理** - 本地追蹤每個模型的每日請求數 (RPD)
+- 多提供者模型路由：依模型類別與可用額度選擇 GitHub Models、Google、Ollama、HuggingFace
+- 配額追蹤與基本 failover：本地記錄各 provider/account/model 的使用量，失敗時嘗試切換下一個候選
+- OpenAI 相容 API：提供 `/v1/chat/completions`、`/v1/completions`、`/v1/models`
+- 檔案與圖片輸入：`/v1/chat/completions` 與 `/v1/file/generate_content` 可接收圖片與文件
+- 圖片生成：提供 `/v1/images/generations`
+- 管理與觀察介面：`/admin/status`、`/admin/logs` 與前端 dashboard
+- MCP / OpenClaw 入口：提供 `/mcp/sse` 與 `/mcp/messages`
 
-✅ **OpenAI 相容** - 完全相容 OpenAI API 格式
+## 實驗中或仍在調校的能力
 
-✅ **OpenClaw / MCP 整合** - 支援 MCP transport、tool registry 與本地 `search_web` 工具
+以下功能目前在程式中已有實作，但仍建議視為實驗性能力，而不是保證行為：
 
-✅ **Tool-Calling Shim** - 可判斷是否需要 web search，回傳 OpenAI 風格 `tool_calls`
+- 搜尋決策與 tool-calling 整合
+- 多步搜尋規劃與搜尋後再合成回答
+- reviewer 有上限的多輪補救回圈
+- 自動判斷資料型圖片需求後先查資料再生圖
+- 對話前的記憶分析與歷史內容注入
 
-✅ **搜尋後合成回答** - 工具結果會重新進 LLM 做整理、分析與引用
+這些流程會持續調整 prompt、路由條件與輸出清理，因此 README 不把它們寫成穩定 SLA 或固定行為。
 
-✅ **引用與來源回傳** - 搜尋型回答可附 `citations`，並要求輸出參考來源
-
-✅ **多模態自動路由** - 同一個 `/v1/chat/completions` 可接圖像與最多 5 份文件，只有必要時才切到多模態模型
-
-✅ **智慧記憶功能** - Pre-chat 分析，自動查詢歷史日誌（使用 gemma-3-27b-it）⭐ NEW
-
-✅ **Gemma 統一意圖分類** - chat / multimodal / memory / image generation 先走 gemma-3-27b-it 分類，再決定後續路徑
-
-✅ **主動式研究管線** - 複雜問題可自動拆成多個搜尋任務，逐步蒐集資料再合成答案
-
-✅ **答案完整性審核回圈** - 第一版回答完成後，Gemma reviewer 可自動判斷缺漏並補查一次再重寫
-
-✅ **程式碼輸出強制標準** - 程式碼任務預設要求完整可執行實作、`main()`、至少 2 組測資、複雜度與邊界條件
-
-✅ **內部 Gemma 用量可視化** - Dashboard 可直接看到 classifier / planner / reviewer 等內部 helper 呼叫次數
-
-✅ **Web UI** - React 前端儀錶板，實時查看配額和對話
-
-✅ **自動文檔** - FastAPI 自動生成 API 文檔
-
-## 今日功能強化
-
-- 對話入口改為先做 Gemma 統一意圖分類，再決定文字聊天、多模態、記憶查詢或自動生圖
-- 搜尋型問題新增 `需求拆解 -> 多次搜尋 -> 彙整 -> reviewer 檢查 -> 必要時補查` 的單次閉環
-- 自動生圖新增資料型圖片管線，像股價 K 線圖這類需求會先查資料再生成
-- 程式碼任務新增最低輸出標準，避免只回片段或概念摘要
-- 回答風格新增研究型工作摘要模式，支援複雜任務但不暴露 raw chain-of-thought
-- `/admin/status` 與前端 dashboard 會顯示內部 Gemma helper 用量與多 account 配額明細
+補充：目前 reviewer 回圈已支援有限多輪重試，預設為 3 輪、上限 6 輪，仍保留停止條件避免成本與延遲失控。
 
 ## 📸 功能展示
 
@@ -123,12 +108,11 @@ python api.py
 
 前端將在 http://localhost:3000 啟動
 
-詳細說明請參考 [FRONTEND_GUIDE.md](FRONTEND_GUIDE.md)
-
 ## 文件導覽
 
 | 文件 | 說明 |
 |---|---|
+| [SYSTEM_ARCHITECTURE.md](SYSTEM_ARCHITECTURE.md) | 系統架構、資料流、模組責任與目前實作邊界 |
 | [OPENCLAW_API_REPORT.md](OPENCLAW_API_REPORT.md) | 最新 API、物件、OpenClaw 與 MCP/tool 能力總覽 |
 | [API_USAGE_GUIDE.md](API_USAGE_GUIDE.md) | 一般 API 呼叫指南 |
 | [DIRECT_QUERY_EXAMPLES.md](DIRECT_QUERY_EXAMPLES.md) | `/v1/direct_query` 詳細範例 |
@@ -176,8 +160,10 @@ python api.py
 - 可辨識 web-search-like tool 宣告並輸出 `tool_calls`
 - 支援 OpenClaw 內建 `web_search` 導向本地搜尋工具
 - 支援 post-tool round 將搜尋結果重新送回 LLM 合成答案
-- 支援在搜尋回應中附加 `citations`
+- 部分搜尋回答可附加 `citations`
 - 支援 chat completions 串流與串流 tool-call 輸出
+
+這一段屬於目前程式已有的整合能力，但實際效果仍受模型、搜尋結果品質與 prompt 影響。
 
 ### Tool-Calling 流程
 
@@ -187,7 +173,9 @@ python api.py
 4. client 執行工具或由 OpenClaw 走 MCP round trip
 5. 工具結果回到 `/v1/chat/completions`
 6. gateway 萃取來源、清理工具輸出，再交給模型做最終回答
-7. 若 reviewer 判定答案仍不完整，會再補做一次 follow-up 搜尋並重寫答案
+7. 若 reviewer 判定答案仍不完整，會補做 follow-up 搜尋並重寫答案；目前支援有限多輪補救
+
+註：第 3、7 步目前屬於實驗流程，並非每次都一定觸發，也不保證所有查詢都比直接回答更好。
 
 ### 研究型回答流程
 
@@ -196,7 +184,9 @@ python api.py
 - 再由 Gemma 規劃多個資訊需求與 query
 - 逐項執行搜尋並整理 evidence
 - 產生第一版答案後，再由 Gemma reviewer 判斷是否仍有缺漏
-- 若有缺漏，會再補查一次並重生最終答案
+- 若有缺漏，會補查並重寫；目前採有限多輪回圈，不是無上限迭代
+
+這個流程目前主要用來改善部分需要外部資訊的問題，但仍在調校中。
 
 ### 資料驅動圖片流程
 
@@ -205,6 +195,8 @@ python api.py
 - 若是，先走搜尋規劃與資料蒐集
 - 將 evidence 注入 image prompt 後再交給 image model 生成
 - 回應可包含 `images`、`citations`、`research_tasks`
+
+這條路徑已接進後端，但目前仍建議視為實驗功能。
 
 ## Tool API List
 

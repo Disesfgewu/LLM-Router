@@ -300,7 +300,7 @@ def _should_search(query: str, tool_choice: Any, raw_messages: List[Any]) -> boo
         return True
     if not query:
         return False
-    keywords = ["天氣", "即時", "最新", "今天", "news", "weather"]
+    keywords = ["天氣", "即時", "最新", "今天", "news", "weather", "current", "today"]
     return any(k in query for k in keywords)
 
 
@@ -354,11 +354,13 @@ def _llm_decide_web_search(
             "role": "system",
             "content": (
                 "你是工具決策器。請判斷是否需要呼叫 web_search。"
-                "只有在需要即時、最新、需外部查證資訊時才 use_web_search=true。"
+                "只要問題需要外部查證、公開資料核對、repo/專案分析、版本比對、事實比較、最新資訊或即時資訊，就應該 use_web_search=true。"
+                "如果只靠模型內部常識就能穩定回答，才 use_web_search=false。"
                 "你只能輸出單一 JSON 物件，不要輸出任何其他文字。"
                 "JSON 格式："
                 '{"use_web_search": true|false, "query": "<最佳搜尋關鍵字>", "alternates": ["<備援關鍵字1>", "<備援關鍵字2>"]}'
                 "alternates 最多 2 個，語言可以與 query 不同以擴展覆蓋範圍。"
+                "例如：詢問 GitHub repo 是什麼、和其他公開專案比較、fork 差異、README/功能分析，通常都需要 web_search。"
             ),
         },
         {
@@ -372,16 +374,55 @@ def _llm_decide_web_search(
     ]
 
     try:
-        response = router.chat(
-            messages=decision_messages,
-            target_category="TextOnlyHigh",
-            include_chat_only=True,
-            temperature=0.0,
-            max_tokens=220,
-        )
         content = ""
-        if response.choices and response.choices[0].message:
-            content = response.choices[0].message.content or ""
+        try:
+            model_id = "gemma-3-27b-it"
+            accounts = []
+            if hasattr(router, "_get_provider_accounts"):
+                accounts = router._get_provider_accounts("Google")
+
+            gemma_user_prompt = (
+                "你是工具決策器。請判斷是否需要呼叫 web_search。"
+                "只要問題需要外部查證、公開資料核對、repo/專案分析、版本比對、事實比較、最新資訊或即時資訊，就應該 use_web_search=true。"
+                "如果只靠模型內部常識就能穩定回答，才 use_web_search=false。"
+                "你只能輸出單一 JSON 物件，不要輸出任何其他文字。"
+                "JSON 格式："
+                '{"use_web_search": true|false, "query": "<最佳搜尋關鍵字>", "alternates": ["<備援關鍵字1>", "<備援關鍵字2>"]}'
+                "例如：詢問 GitHub repo 是什麼、和其他公開專案比較、fork 差異、README/功能分析，通常都需要 web_search。"
+                f"\n\n最近對話：\n{transcript_text}\n\n最新使用者問題：{clean_query}\n\n請回傳 JSON。"
+            )
+
+            for account in accounts:
+                account_id = account.get("id", "default")
+                usage_key = router.get_usage_key("Google", model_id, account_id)
+                if router._get_remaining_quota(usage_key) == 0:
+                    continue
+                client = router._get_client("Google", account_id)
+                if hasattr(router, "record_internal_usage"):
+                    router.record_internal_usage("gemma_search_decider_calls")
+                response = client.chat.completions.create(
+                    model=model_id,
+                    messages=[{"role": "user", "content": gemma_user_prompt}],
+                    temperature=0.0,
+                    max_tokens=220,
+                )
+                router._decrement_quota(usage_key)
+                if response.choices and response.choices[0].message:
+                    content = response.choices[0].message.content or ""
+                break
+        except Exception:
+            logger.exception("[ToolShim] gemma decision call failed; fallback to TextOnlyHigh")
+
+        if not content:
+            response = router.chat(
+                messages=decision_messages,
+                target_category="TextOnlyHigh",
+                include_chat_only=False,
+                temperature=0.0,
+                max_tokens=220,
+            )
+            if response.choices and response.choices[0].message:
+                content = response.choices[0].message.content or ""
 
         parsed = _extract_json_object(content)
         if not parsed:
