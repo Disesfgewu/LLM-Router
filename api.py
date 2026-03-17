@@ -44,7 +44,7 @@ from dotenv import load_dotenv
 load_dotenv()  # 載入 .env 檔案
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -508,9 +508,14 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     logger.info("✅ 自動定時任務已啟動")
     logger.info("🔌 MCP Server 啟動 (Endpoints: /mcp/sse, /mcp/messages)")
-    
+
+    # ── Auth DB ─────────────────────────────────────────────
+    auth_init_db()
+    logger.info("🔐 Auth DB 已初始化")
+
     yield
-    
+
+    purge_expired_sessions()
     logger.info("🛑 停止自動定時任務...")
     scheduler.shutdown()
     logger.info("✅ 自動定時任務已停止")
@@ -524,6 +529,120 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Auth Middleware ────────────────────────────────────────
+
+# Paths that require NO authentication at all
+_AUTH_PUBLIC = {"/", "/health", "/auth/register", "/auth/login"}
+# Path prefixes that are accessible with session token only (no API key)
+_SESSION_ONLY_PREFIXES = ("/auth/", "/admin/")
+# Paths that proxy to MCP — keep as-is (internal tool use)
+_MCP_PREFIXES = ("/mcp/",)
+
+
+def _is_localhost_client(request: Request) -> bool:
+    if not request.client or not request.client.host:
+        return False
+    host = request.client.host
+    return host in {"127.0.0.1", "::1", "localhost"}
+
+
+def _path_to_scope(path: str) -> Optional[str]:
+    """Map request path to its endpoint scope name."""
+    if "/chat/" in path:
+        return "chat"
+    if path.endswith("/completions") or "/completions" in path:
+        return "completions"
+    if "/direct_query" in path:
+        return "direct_query"
+    if "/images/" in path:
+        return "images"
+    if "/file/" in path:
+        return "file"
+    if "/models" in path:
+        return "models"
+    return None
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    path = request.url.path
+
+    # OPTIONS preflight — let CORS handle it
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    # Fully public (/health, /, /auth/login, /auth/register)
+    if path in _AUTH_PUBLIC:
+        return await call_next(request)
+
+    # MCP endpoints pass through without auth enforcement
+    if any(path.startswith(p) for p in _MCP_PREFIXES):
+        return await call_next(request)
+
+    # Single-device hardening: only allow local access to auth/admin by default.
+    local_admin_only = os.getenv("AUTH_LOCAL_ADMIN_ONLY", "1").lower() not in {"0", "false", "no"}
+    if local_admin_only and any(path.startswith(p) for p in _SESSION_ONLY_PREFIXES):
+        if not _is_localhost_client(request):
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "此端點僅允許本機存取"},
+            )
+
+    # ── Attempt session-token auth ──────────────────────────
+    session_token = request.headers.get("X-Session-Token", "").strip()
+    if session_token:
+        acct = validate_session(session_token)
+        if acct:
+            if path.startswith("/admin/") and not acct["is_admin"]:
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": "需要管理員權限"},
+                )
+            request.state.auth = acct
+            return await call_next(request)
+        # Invalid/expired session — do not fall through to API key
+        # (prevents session-fixation escalation)
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Session token 無效或已過期，請重新登入"},
+        )
+
+    # ── Attempt API-key auth (Bearer token) ─────────────────
+    # Admin paths cannot be accessed with API keys
+    if any(path.startswith(p) for p in _SESSION_ONLY_PREFIXES):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "此端點需要登入 Session（X-Session-Token header）"},
+        )
+
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        raw_key = auth_header[7:].strip()
+        client_ip: Optional[str] = request.client.host if request.client else None
+        endpoint_scope = _path_to_scope(path)
+        acct = validate_api_key(raw_key, client_ip=client_ip, endpoint_scope=endpoint_scope)
+        if acct:
+            request.state.auth = acct
+            return await call_next(request)
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "API key 無效、已過期、超過速率限制或無此端點的存取權限"},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return JSONResponse(
+        status_code=401,
+        content={
+            "detail": (
+                "需要認證。"
+                "外部應用程式請使用 Authorization: Bearer <api_key>，"
+                "前端請使用 X-Session-Token: <session_token>"
+            )
+        },
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
 
 # ── Router Instance (Singleton) ────────────────────────────
 router_instance: Optional[ModelRouter] = None
@@ -1015,6 +1134,27 @@ from app.schemas import (
     ChatCompletionResponse,
     FileContentRequest,
     ImageGenerationRequest,
+)
+from app.auth import (
+    init_db as auth_init_db,
+    login as auth_login,
+    logout as auth_logout,
+    validate_session,
+    register_account,
+    get_account_by_id,
+    list_all_accounts,
+    set_account_active,
+    generate_full_key,
+    generate_agent_key,
+    list_api_keys,
+    revoke_api_key,
+    validate_api_key,
+    add_ip_whitelist,
+    list_ip_whitelist,
+    delete_ip_whitelist,
+    get_audit_log,
+    ALLOWED_SCOPES,
+    purge_expired_sessions,
 )
 
 
@@ -2461,6 +2601,233 @@ async def file_generate_content(
                 logger.info(f"[File Cleanup] 已刪除本地臨時文件: {temp_file_path}")
             except Exception as e:
                 logger.warning(f"[File Cleanup] 刪除本地臨時文件失敗: {e}")
+
+
+# ── Auth Endpoints ─────────────────────────────────────────
+
+@app.post("/auth/register")
+async def auth_register(request: Request):
+    """
+    建立新帳號。
+    第一個註冊的帳號自動成為管理員。
+    """
+    body = await request.json()
+    username = str(body.get("username", "")).strip()
+    email = str(body.get("email", "")).strip()
+    password = str(body.get("password", ""))
+    if not username or not email or not password:
+        raise HTTPException(status_code=422, detail="username / email / password 不可為空")
+    try:
+        acct = register_account(username, email, password)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return acct
+
+
+@app.post("/auth/login")
+async def auth_login_endpoint(request: Request):
+    """
+    登入並取得 session token。
+    返回的 token 請存放在記憶體中（勿寫入 localStorage 或磁碟）。
+    """
+    body = await request.json()
+    username = str(body.get("username", "")).strip()
+    password = str(body.get("password", ""))
+    result = auth_login(username, password)
+    if not result:
+        raise HTTPException(status_code=401, detail="帳號或密碼錯誤")
+    return result
+
+
+@app.post("/auth/logout")
+async def auth_logout_endpoint(request: Request):
+    """登出並撤銷 session token。"""
+    token = request.headers.get("X-Session-Token", "").strip()
+    if token:
+        auth_logout(token)
+    return {"status": "ok", "message": "已登出"}
+
+
+@app.get("/auth/me")
+async def auth_me(request: Request):
+    """返回目前登入帳號資訊。"""
+    acct = getattr(request.state, "auth", None)
+    if not acct:
+        raise HTTPException(status_code=401, detail="未登入")
+    full = get_account_by_id(acct["account_id"])
+    if not full:
+        raise HTTPException(status_code=404, detail="帳號不存在")
+    return full
+
+
+# ── API Key management endpoints ───────────────────────────
+
+@app.get("/auth/keys")
+async def auth_list_keys(request: Request):
+    """列出自己的所有 API key（不含 hash 或完整 key）。"""
+    acct = getattr(request.state, "auth", None)
+    if not acct:
+        raise HTTPException(status_code=401, detail="未登入")
+    return list_api_keys(acct["account_id"])
+
+
+@app.post("/auth/keys/full")
+async def auth_create_full_key(request: Request):
+    """
+    產生全存取 API key (mk_)。
+    完整 key 只在這次回應中顯示一次，之後無法再取得。
+    僅限管理員使用。
+    """
+    acct = getattr(request.state, "auth", None)
+    if not acct:
+        raise HTTPException(status_code=401, detail="未登入")
+    if not acct.get("is_admin"):
+        raise HTTPException(status_code=403, detail="僅管理員可以產生全存取 key")
+    body = await request.json()
+    name = str(body.get("name", "")).strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="name 不可為空")
+    try:
+        full_key, record = generate_full_key(acct["account_id"], name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    record["full_key"] = full_key  # Only shown here, never again
+    return record
+
+
+@app.post("/auth/keys/agent")
+async def auth_create_agent_key(request: Request):
+    """
+    產生受限 agent API key (ma_)。
+    需要指定 scopes（限定可呼叫的端點）、過期時間、RPM 上限。
+    完整 key 只在這次回應中顯示一次。
+    """
+    acct = getattr(request.state, "auth", None)
+    if not acct:
+        raise HTTPException(status_code=401, detail="未登入")
+    body = await request.json()
+    name = str(body.get("name", "")).strip()
+    scopes = body.get("scopes", [])
+    expires_hours = int(body.get("expires_hours", 24))
+    rpm_limit = int(body.get("rpm_limit", 60))
+
+    if not name:
+        raise HTTPException(status_code=422, detail="name 不可為空")
+    if not isinstance(scopes, list):
+        raise HTTPException(status_code=422, detail="scopes 必須是陣列")
+    try:
+        full_key, record = generate_agent_key(
+            acct["account_id"], name, scopes, expires_hours, rpm_limit
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    record["full_key"] = full_key  # Only shown here, never again
+    return record
+
+
+@app.delete("/auth/keys/{key_id}")
+async def auth_revoke_key(key_id: int, request: Request):
+    """撤銷指定 API key。"""
+    acct = getattr(request.state, "auth", None)
+    if not acct:
+        raise HTTPException(status_code=401, detail="未登入")
+    ok = revoke_api_key(key_id, acct["account_id"])
+    if not ok:
+        raise HTTPException(status_code=404, detail="Key 不存在或不屬於此帳號")
+    return {"status": "ok", "message": f"Key {key_id} 已撤銷"}
+
+
+# ── IP Whitelist endpoints ──────────────────────────────────
+
+@app.get("/auth/whitelist")
+async def auth_list_whitelist(request: Request):
+    """列出此帳號的 IP 白名單。"""
+    acct = getattr(request.state, "auth", None)
+    if not acct:
+        raise HTTPException(status_code=401, detail="未登入")
+    return list_ip_whitelist(acct["account_id"])
+
+
+@app.post("/auth/whitelist")
+async def auth_add_whitelist(request: Request):
+    """新增 IP / CIDR 到白名單。空白名單代表允許所有 IP。"""
+    acct = getattr(request.state, "auth", None)
+    if not acct:
+        raise HTTPException(status_code=401, detail="未登入")
+    body = await request.json()
+    ip_cidr = str(body.get("ip_cidr", "")).strip()
+    description = str(body.get("description", "")).strip()
+    if not ip_cidr:
+        raise HTTPException(status_code=422, detail="ip_cidr 不可為空")
+    try:
+        entry = add_ip_whitelist(acct["account_id"], ip_cidr, description)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return entry
+
+
+@app.delete("/auth/whitelist/{entry_id}")
+async def auth_delete_whitelist(entry_id: int, request: Request):
+    """從白名單移除一筆 IP 規則。"""
+    acct = getattr(request.state, "auth", None)
+    if not acct:
+        raise HTTPException(status_code=401, detail="未登入")
+    ok = delete_ip_whitelist(entry_id, acct["account_id"])
+    if not ok:
+        raise HTTPException(status_code=404, detail="白名單項目不存在")
+    return {"status": "ok", "message": f"Entry {entry_id} 已移除"}
+
+
+@app.get("/auth/audit")
+async def auth_audit_log(request: Request):
+    """查看此帳號的 API key 使用稽核紀錄（最新 100 筆）。"""
+    acct = getattr(request.state, "auth", None)
+    if not acct:
+        raise HTTPException(status_code=401, detail="未登入")
+    return get_audit_log(acct["account_id"])
+
+
+@app.get("/auth/scopes")
+async def auth_list_scopes():
+    """列出 agent key 可用的 scope 清單。"""
+    return {"scopes": sorted(ALLOWED_SCOPES)}
+
+
+# ── Admin: Account management ───────────────────────────────
+
+@app.get("/admin/accounts")
+async def admin_list_accounts(request: Request):
+    """（管理員）列出所有帳號。"""
+    acct = getattr(request.state, "auth", None)
+    if not acct or not acct.get("is_admin"):
+        raise HTTPException(status_code=403, detail="需要管理員權限")
+    return list_all_accounts()
+
+
+@app.post("/admin/accounts/{account_id}/activate")
+async def admin_activate_account(account_id: int, request: Request):
+    """（管理員）啟用帳號。"""
+    acct = getattr(request.state, "auth", None)
+    if not acct or not acct.get("is_admin"):
+        raise HTTPException(status_code=403, detail="需要管理員權限")
+    ok = set_account_active(account_id, True)
+    if not ok:
+        raise HTTPException(status_code=404, detail="帳號不存在")
+    return {"status": "ok", "message": f"帳號 {account_id} 已啟用"}
+
+
+@app.post("/admin/accounts/{account_id}/deactivate")
+async def admin_deactivate_account(account_id: int, request: Request):
+    """（管理員）停用帳號（不可停用自己）。"""
+    acct = getattr(request.state, "auth", None)
+    if not acct or not acct.get("is_admin"):
+        raise HTTPException(status_code=403, detail="需要管理員權限")
+    if account_id == acct["account_id"]:
+        raise HTTPException(status_code=400, detail="不可停用自己的帳號")
+    ok = set_account_active(account_id, False)
+    if not ok:
+        raise HTTPException(status_code=404, detail="帳號不存在")
+    return {"status": "ok", "message": f"帳號 {account_id} 已停用"}
 
 
 # ── Main ───────────────────────────────────────────────────
