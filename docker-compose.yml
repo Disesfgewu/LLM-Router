@@ -1,0 +1,20 @@
+version: "3.9"
+
+services:
+  modelrouter:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      # Persist quota tracker, auth DB, and logs outside the container
+      - ./usage_tracker.json:/app/usage_tracker.json
+      - ./auth.db:/app/auth.db
+      - ./app/app.log:/app/app/app.log
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

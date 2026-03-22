@@ -102,9 +102,10 @@
 #### Python (使用 requests)
 ```python
 import requests
-import json
 
 url = "http://localhost:8000/v1/completions"
+# 假設您已從前端儀表板生成了 API key
+api_key = "ma_... or mk_..." 
 
 payload = {
     "model": "auto",
@@ -114,7 +115,8 @@ payload = {
 }
 
 headers = {
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
+    "Authorization": f"Bearer {api_key}" # 每個 API 請求都需要認證
 }
 
 response = requests.post(url, json=payload, headers=headers)
@@ -123,6 +125,8 @@ if response.status_code == 200:
     result = response.json()
     print("回答:", result["choices"][0]["text"])
     print("使用模型:", result["model"])
+elif response.status_code == 401:
+    print("認證失敗：API key 無效或未提供。")
 else:
     print("錯誤:", response.status_code, response.text)
 ```

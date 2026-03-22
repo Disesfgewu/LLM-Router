@@ -60,7 +60,7 @@ _FULL_KEY_PREFIX    = "mk_"
 _AGENT_KEY_PREFIX   = "ma_"
 _KNOWN_PREFIXES     = (_FULL_KEY_PREFIX, _AGENT_KEY_PREFIX)
 
-ALLOWED_SCOPES = {"chat", "completions", "direct_query", "images", "file", "models"}
+ALLOWED_SCOPES = {"chat", "completions", "direct_query", "images", "file", "models", "embeddings"}
 
 # Single-device hardening defaults (can be overridden by env vars)
 _DEFAULT_AGENT_MAX_HOURS = int(os.getenv("AUTH_AGENT_MAX_HOURS", "24"))

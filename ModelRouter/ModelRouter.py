@@ -100,6 +100,14 @@ class ModelRouter:
                 "chat_capable": False,
                 "task": "image_generation",
             },
+            "gemini-embedding-2-preview": {
+                "chat_capable": False,
+                "task": "embedding",
+            },
+            "gemini-embedding-001": {
+                "chat_capable": False,
+                "task": "embedding",
+            },
         }
         
         # 會話歷史記憶（保留最近的對話）
@@ -149,7 +157,13 @@ class ModelRouter:
                     "imagen-4-ultra-generate-001": 25,
                     "imagen-4-fast-generate-001": 25,
                 }
-            }
+            },
+            "Embedding": {
+                "Google": {
+                    "gemini-embedding-2-preview": 100,   # 100 RPD free tier per account
+                    "gemini-embedding-001": 100,
+                }
+            },
         }
         
         # 動態建立所有類別的 priority_flags
@@ -946,12 +960,135 @@ class ModelRouter:
                     return res
             
             raise RuntimeError("💀 所有模型皆不可用！")
-            
+
         except RuntimeError:
             raise
         except Exception as e:
             logger.critical(f"[Critical] Chat Error: {type(e).__name__}: {e}")
             raise
+
+    def embed(
+        self,
+        input_texts,
+        model: str = "gemini-embedding-2-preview",
+        **kwargs,
+    ) -> Any:
+        """
+        Generate embeddings via Google Gemini Embedding 2 (gemini-embedding-2-preview).
+        Uses the google-genai SDK since Google's OpenAI-compatible endpoint does not
+        support embedding models.
+
+        Returns a dict shaped like an OpenAI embeddings response for RAG pipelines:
+            {"data": [{"object": "embedding", "embedding": [...], "index": 0}], ...}
+
+        Raises RuntimeError if all accounts are exhausted.
+        """
+        try:
+            import google.genai as _genai  # new SDK (google-genai >= 1.0)
+        except ImportError:
+            raise RuntimeError(
+                "google-genai package is required for embeddings. "
+                "Install it with: pip install google-genai"
+            )
+
+        if isinstance(input_texts, str):
+            input_texts = [input_texts]
+
+        accounts = self._get_provider_accounts("Google")
+        last_error = None
+        for account in accounts:
+            account_id = account.get("id", "default")
+            usage_key = self.get_usage_key("Google", model, account_id)
+            if self._get_remaining_quota(usage_key) == 0:
+                continue
+            api_key = account.get("api_key", "")
+            if not api_key or api_key == "dummy":
+                continue
+            try:
+                genai_client = _genai.Client(api_key=api_key)
+                # embed_content accepts a single string; batch over list
+                embeddings_out = []
+                for text in input_texts:
+                    result = genai_client.models.embed_content(
+                        model=model,
+                        contents=text,
+                    )
+                    embeddings_out.append(result.embeddings[0].values)
+
+                self._decrement_quota(usage_key)
+                logger.info(
+                    "[Embed] model=%s account=%s vectors=%d dims=%d",
+                    model, account_id, len(embeddings_out),
+                    len(embeddings_out[0]) if embeddings_out else 0,
+                )
+
+                # Return OpenAI-compatible structure as a plain dict
+                return {
+                    "data": [
+                        {"object": "embedding", "embedding": list(v), "index": i}
+                        for i, v in enumerate(embeddings_out)
+                    ],
+                    "model": model,
+                }
+            except Exception as exc:
+                last_error = exc
+                msg = str(exc).lower()
+                if "rate" in msg or "quota" in msg or "429" in msg:
+                    self._mark_quota_exhausted(usage_key)
+                logger.warning("[Embed] account=%s failed: %s", account_id, exc)
+        raise RuntimeError(f"embedding model {model} unavailable: {last_error}")
+
+    def chat_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        target_category: Optional[str] = None,
+        include_chat_only: bool = True,
+        **kwargs,
+    ):
+        """
+        Like chat(), but streams tokens via stream=True on the OpenAI client.
+        Yields raw ChatCompletionChunk objects. The caller serialises them to SSE.
+        Falls back to the next available model/category on error.
+        Raises RuntimeError if no model is available.
+        """
+        categories: List[str]
+        if target_category:
+            categories = [target_category]
+        elif include_chat_only:
+            categories = ["TextOnlyHigh", "ChatOnly", "TextOnlyLow"]
+        else:
+            categories = ["TextOnlyHigh", "TextOnlyLow"]
+
+        for cat in categories:
+            model_list = self.priority_map.get(cat, [])
+            for entry in model_list:
+                provider = entry["provider"]
+                model_id = entry["model_id"]
+                account_id = str(entry.get("account_id", "default"))
+                usage_key = self.get_usage_key(provider, model_id, account_id)
+                if self._get_remaining_quota(usage_key) == 0:
+                    continue
+                try:
+                    client = self._get_client(provider, account_id)
+                    prepared = self._prepare_kwargs(model_id, dict(kwargs))
+                    prepared.pop("stream", None)
+                    stream_resp = client.chat.completions.create(
+                        model=model_id,
+                        messages=messages,  # type: ignore[arg-type]
+                        stream=True,
+                        **prepared,
+                    )
+                    self._decrement_quota(usage_key)
+                    logger.info(
+                        "[Stream] cat=%s provider=%s account=%s model=%s",
+                        cat, provider, account_id, model_id,
+                    )
+                    yield from stream_resp
+                    return
+                except Exception as exc:
+                    logger.warning("[Stream] %s/%s failed: %s", provider, model_id, exc)
+                    continue
+        raise RuntimeError("chat_stream: no available model")
 
     def get_model_quota_summary(self, provider: str, model_id: str, rpd_limit: int) -> Dict[str, Any]:
         accounts = self._get_provider_accounts(provider)

@@ -3,7 +3,7 @@
 Pydantic request/response schemas for all API endpoints.
 """
 
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 
 from pydantic import BaseModel
 
@@ -62,3 +62,12 @@ class ImageGenerationRequest(BaseModel):
     n: Optional[int] = 1
     size: Optional[str] = "1024x1024"
     response_format: Optional[str] = "b64_json"
+
+
+# ── Embeddings ──────────────────────────────────────────────
+
+class EmbeddingRequest(BaseModel):
+    model: str = "gemini-embedding-2-preview"
+    input: Union[str, List[str]]
+    encoding_format: Optional[str] = "float"   # "float" or "base64"
+    dimensions: Optional[int] = None            # reserved, not yet forwarded

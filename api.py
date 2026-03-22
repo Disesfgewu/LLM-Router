@@ -78,7 +78,7 @@ logger = logging.getLogger("api")
 
 # ── App Config ─────────────────────────────────────────────
 APP_TITLE = "ModelRouter API Gateway"
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.0.0"
 
 # ── Universal Agent Identity (injected into every LLM call) ─
 AGENT_SYSTEM_PROMPT = (
@@ -521,7 +521,26 @@ async def lifespan(app: FastAPI):
     logger.info("✅ 自動定時任務已停止")
 
 # ── FastAPI App ────────────────────────────────────────────
-app = FastAPI(title=APP_TITLE, version=APP_VERSION, lifespan=lifespan)
+app = FastAPI(
+    title=APP_TITLE,
+    version=APP_VERSION,
+    description=(
+        "OpenAI-compatible AI Gateway with multi-provider routing "
+        "(GitHub Models, Google Gemini, Ollama, HuggingFace). "
+        "Supports chat completions, embeddings, image generation, RAG, and multimodal inputs."
+    ),
+    openapi_tags=[
+        {"name": "Chat",       "description": "Chat completion endpoints — streaming supported"},
+        {"name": "Embeddings", "description": "Text embeddings for RAG — uses Google Gemini Embedding 2 (text-embedding-004)"},
+        {"name": "Images",     "description": "Image generation: FLUX.1, Stable Diffusion XL, Imagen 4"},
+        {"name": "Models",     "description": "List available models and per-account quota status"},
+        {"name": "Files",      "description": "File upload and multimodal content extraction"},
+        {"name": "MCP",        "description": "Model Context Protocol SSE endpoints for tool use"},
+        {"name": "Auth",       "description": "Account registration, session login, and API key management"},
+        {"name": "Admin",      "description": "Quota management and system status (session-only, localhost by default)"},
+    ],
+    lifespan=lifespan,
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -529,6 +548,64 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Version Header Middleware ──────────────────────────────
+@app.middleware("http")
+async def add_version_header(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-API-Version"] = APP_VERSION
+    response.headers["X-Powered-By"] = "ModelRouter"
+    return response
+
+
+# ── Standardized Error Handlers ────────────────────────────
+def _status_to_error_type(status_code: int) -> str:
+    if status_code == 400:
+        return "invalid_request_error"
+    if status_code == 401:
+        return "authentication_error"
+    if status_code == 403:
+        return "permission_error"
+    if status_code == 404:
+        return "not_found_error"
+    if status_code == 429:
+        return "rate_limit_error"
+    if status_code >= 500:
+        return "server_error"
+    return "api_error"
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": {
+                "message": exc.detail if isinstance(exc.detail, str) else str(exc.detail),
+                "type": _status_to_error_type(exc.status_code),
+                "code": exc.status_code,
+                "param": None,
+            }
+        },
+        headers=dict(getattr(exc, "headers", None) or {}),
+    )
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled exception")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": {
+                "message": "Internal server error",
+                "type": "server_error",
+                "code": 500,
+                "param": None,
+            }
+        },
+    )
+
 
 # ── Auth Middleware ────────────────────────────────────────
 
@@ -551,6 +628,8 @@ def _path_to_scope(path: str) -> Optional[str]:
     """Map request path to its endpoint scope name."""
     if "/chat/" in path:
         return "chat"
+    if "/embeddings" in path:
+        return "embeddings"
     if path.endswith("/completions") or "/completions" in path:
         return "completions"
     if "/direct_query" in path:
@@ -605,7 +684,7 @@ async def auth_middleware(request: Request, call_next):
         # (prevents session-fixation escalation)
         return JSONResponse(
             status_code=401,
-            content={"detail": "Session token 無效或已過期，請重新登入"},
+            content={"error": {"message": "Session token 無效或已過期，請重新登入", "type": "authentication_error", "code": 401, "param": None}},
         )
 
     # ── Attempt API-key auth (Bearer token) ─────────────────
@@ -613,7 +692,7 @@ async def auth_middleware(request: Request, call_next):
     if any(path.startswith(p) for p in _SESSION_ONLY_PREFIXES):
         return JSONResponse(
             status_code=401,
-            content={"detail": "此端點需要登入 Session（X-Session-Token header）"},
+            content={"error": {"message": "此端點需要登入 Session（X-Session-Token header）", "type": "authentication_error", "code": 401, "param": None}},
         )
 
     auth_header = request.headers.get("Authorization", "")
@@ -627,19 +706,13 @@ async def auth_middleware(request: Request, call_next):
             return await call_next(request)
         return JSONResponse(
             status_code=401,
-            content={"detail": "API key 無效、已過期、超過速率限制或無此端點的存取權限"},
+            content={"error": {"message": "API key 無效、已過期、超過速率限制或無此端點的存取權限", "type": "authentication_error", "code": 401, "param": None}},
             headers={"WWW-Authenticate": "Bearer"},
         )
 
     return JSONResponse(
         status_code=401,
-        content={
-            "detail": (
-                "需要認證。"
-                "外部應用程式請使用 Authorization: Bearer <api_key>，"
-                "前端請使用 X-Session-Token: <session_token>"
-            )
-        },
+        content={"error": {"message": "需要認證。外部應用程式請使用 Authorization: Bearer <api_key>，前端請使用 X-Session-Token: <session_token>", "type": "authentication_error", "code": 401, "param": None}},
         headers={"WWW-Authenticate": "Bearer"},
     )
 
@@ -1134,6 +1207,7 @@ from app.schemas import (
     ChatCompletionResponse,
     FileContentRequest,
     ImageGenerationRequest,
+    EmbeddingRequest,
 )
 from app.auth import (
     init_db as auth_init_db,
@@ -1171,9 +1245,11 @@ async def root():
         "endpoints": {
             "chat": "/v1/chat/completions",
             "completion": "/v1/completions",
+            "embeddings": "/v1/embeddings",
             "images": "/v1/images/generations",
             "models": "/v1/models",
             "health": "/health",
+            "docs": "/docs",
             "direct_query": "/v1/direct_query",
             "file_generate": "/v1/file/generate_content",
             "admin_reset": "/admin/reset_quotas",
@@ -1189,7 +1265,7 @@ async def health_check():
     return {"status": "healthy", "server": "up"}
 
 
-@app.api_route("/v1/models", methods=["GET", "POST"])
+@app.api_route("/v1/models", methods=["GET", "POST"], tags=["Models"])
 async def list_models():
     """列出所有可用模型"""
     router = get_router()
@@ -1248,7 +1324,7 @@ async def handle_messages(request: Request):
 
 # ── Completion Endpoints ───────────────────────────────────
 
-@app.post("/v1/chat/completions")
+@app.post("/v1/chat/completions", tags=["Chat"])
 async def chat_completions(request: Request):
     """
     OpenAI-compatible Chat Completions API
@@ -1939,6 +2015,37 @@ async def chat_completions(request: Request):
         messages = _append_code_output_requirements(messages, latest_user_text)
 
         # 目前先不真正把 tools 傳下去，只做兼容吸收
+        review_evidence_summary = auto_search_evidence_summary or post_tool_evidence_summary
+
+        # ── True streaming path (no search evidence, direct to model) ──
+        if stream and not review_evidence_summary:
+            request_id = f"chatcmpl-{int(time.time())}"
+            created_ts = int(time.time())
+            stream_model_used = model
+
+            def _true_sse_generator():
+                nonlocal stream_model_used
+                try:
+                    first_chunk = True
+                    for chunk in router.chat_stream(
+                        messages=messages,
+                        target_category=target_category,
+                        include_chat_only=True,
+                        **kwargs,
+                    ):
+                        if first_chunk:
+                            if hasattr(chunk, "model") and chunk.model:
+                                stream_model_used = chunk.model
+                            first_chunk = False
+                        yield f"data: {json.dumps(chunk.model_dump())}\n\n"
+                    yield "data: [DONE]\n\n"
+                except Exception as stream_exc:
+                    logger.error("[Stream] true-stream generator error: %s", stream_exc)
+                    yield "data: [DONE]\n\n"
+
+            logger.info("[Stream] True token streaming (no search evidence)")
+            return StreamingResponse(_true_sse_generator(), media_type="text/event-stream")
+
         response = router.chat(
             messages=messages,
             target_category=target_category,
@@ -1953,8 +2060,6 @@ async def chat_completions(request: Request):
             content = response.choices[0].message.content or ""
         if hasattr(response, "model"):
             model_used = response.model
-
-        review_evidence_summary = auto_search_evidence_summary or post_tool_evidence_summary
         if latest_user_text and review_evidence_summary and intent_result.get("intent") == "text_chat":
             max_review_iterations = int(raw.get("max_review_iterations", 3) or 3)
             max_review_iterations = max(1, min(max_review_iterations, 6))
@@ -2437,7 +2542,7 @@ async def direct_query(request: DirectQueryRequest):
         raise HTTPException(status_code=500, detail=detail_msg)
 
 
-@app.post("/v1/images/generations")
+@app.post("/v1/images/generations", tags=["Images"])
 async def image_generations(request: ImageGenerationRequest):
     """OpenAI-compatible image generation endpoint backed by Google Imagen models."""
     router = get_router()
@@ -2461,7 +2566,44 @@ async def image_generations(request: ImageGenerationRequest):
     )
 
 
-@app.post("/v1/file/generate_content")
+@app.post("/v1/embeddings", tags=["Embeddings"])
+async def create_embeddings(body: EmbeddingRequest, request: Request):
+    """
+    OpenAI-compatible Embeddings API — Google Gemini Embedding 2.
+
+    Drop-in compatible with LangChain / LlamaIndex OpenAI embeddings clients for RAG pipelines.
+
+    - **input**: single string or list of strings
+    - **model**: `gemini-embedding-2-preview` (default, 3072-dim) or `gemini-embedding-001`
+    - Returns 3072-dim float vectors in OpenAI format
+    """
+    router = get_router()
+    input_texts = body.input if isinstance(body.input, list) else [body.input]
+    if not input_texts or not any(t.strip() for t in input_texts):
+        raise HTTPException(status_code=400, detail="input must not be empty")
+
+    try:
+        result = router.embed(input_texts, model=body.model)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        logger.exception("[Embeddings] unexpected error")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    # result is a dict: {"data": [...], "model": "..."}
+    total_tokens = sum(len(t) // 4 for t in input_texts)
+    return {
+        "object": "list",
+        "data": result["data"],
+        "model": result.get("model", body.model),
+        "usage": {
+            "prompt_tokens": total_tokens,
+            "total_tokens": total_tokens,
+        },
+    }
+
+
+@app.post("/v1/file/generate_content", tags=["Files"])
 async def file_generate_content(
     file: UploadFile = File(...),
     prompt: str = Form(...),
