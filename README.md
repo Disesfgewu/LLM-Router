@@ -1,87 +1,64 @@
 # ModelRouter API Gateway
 
-這是一個以 FastAPI 為核心的多模型 API gateway，提供 OpenAI 相容介面，並在 GitHub Models、Google、Ollama、HuggingFace 之間做路由、配額追蹤與部分失敗切換。
+**v2.0.0** — OpenAI 相容的多模型 AI Gateway，支援 Chat、Embeddings、圖片生成、多模態輸入與 RAG 工作流程。
 
-目前專案重點放在三件事：
+以 FastAPI 為核心，在 GitHub Models、Google Gemini、Ollama、HuggingFace 之間做智慧路由、配額追蹤與自動 failover。
 
-- 用單一 API 入口包住多個模型提供者
-- 讓常見聊天、檔案輸入、圖片生成與管理查詢可以共用同一套服務
-- 保留實驗性搜尋與研究流程，但不把它描述成已完全穩定
+---
 
-## 目前可確認的能力
+## 功能總覽
 
-- 多提供者模型路由：依模型類別與可用額度選擇 GitHub Models、Google、Ollama、HuggingFace
-- 配額追蹤與基本 failover：本地記錄各 provider/account/model 的使用量，失敗時嘗試切換下一個候選
-- OpenAI 相容 API：提供 `/v1/chat/completions`、`/v1/completions`、`/v1/models`
-- 檔案與圖片輸入：`/v1/chat/completions` 與 `/v1/file/generate_content` 可接收圖片與文件
-- 圖片生成：提供 `/v1/images/generations`
-- 管理與觀察介面：`/admin/status`、`/admin/logs` 與前端 dashboard
-- MCP / OpenClaw 入口：提供 `/mcp/sse` 與 `/mcp/messages`
+| 類別 | 功能 |
+|---|---|
+| **Chat** | OpenAI 相容 chat completions，真實 token 串流 (SSE)，多輪對話 |
+| **Embeddings** | Google Gemini Embedding 2（`gemini-embedding-2-preview`），OpenAI 相容格式，RAG 整合 |
+| **圖片生成** | FLUX.1-schnell、Stable Diffusion XL (HuggingFace)、Imagen 4 系列 (Google) |
+| **多模態** | 圖片、PDF、CSV、XLSX 文件附件，自動抽取與摘要 |
+| **搜尋與研究** | 內建 web search，多步研究規劃，reviewer 回圈補救 |
+| **記憶** | Pre-chat 記憶分析，自動注入歷史 log，對話記錄保留 |
+| **Auth** | 雙層 API Key（全功能 `mk_` / 限定 `ma_`），Session 登入，IP 白名單，審計日誌 |
+| **Docker** | Dockerfile + docker-compose，開箱即用部署 |
+| **MCP** | Model Context Protocol SSE 入口，OpenClaw 相容 |
 
-## 實驗中或仍在調校的能力
-
-以下功能目前在程式中已有實作，但仍建議視為實驗性能力，而不是保證行為：
-
-- 搜尋決策與 tool-calling 整合
-- 多步搜尋規劃與搜尋後再合成回答
-- reviewer 有上限的多輪補救回圈
-- 自動判斷資料型圖片需求後先查資料再生圖
-- 對話前的記憶分析與歷史內容注入
-
-這些流程會持續調整 prompt、路由條件與輸出清理，因此 README 不把它們寫成穩定 SLA 或固定行為。
-
-補充：目前 reviewer 回圈已支援有限多輪重試，預設為 3 輪、上限 6 輪，仍保留停止條件避免成本與延遲失控。
-
-## 📸 功能展示
-
-### Web UI 介面預覽
-
-#### 💬 對話介面
-即時與 AI 對話。
-
-![對話介面](demo-png/demo-chat.PNG)
-
-#### 🤖 AI 回應展示
-查看 AI 的詳細回應和對話內容。
-
-![AI 回應](demo-png/demo-answer.PNG)
-
-#### 📊 配額儀錶板
-即時監控各模型的使用情況和配額狀態。
-
-![配額儀錶板](demo-png/demo-dash.PNG)
-
-#### 🔄 智慧切換
-自動在不同 AI 提供者之間切換，確保服務持續可用。
-
-![智慧切換](demo-png/demo-switch.PNG)
-
-#### 📝 日誌檢視器
-查看系統運行日誌和 API 呼叫記錄。
-
-![日誌檢視器](demo-png/demo-log.PNG)
+---
 
 ## 快速開始
 
 ### 1. 設定環境變數
 
-創建 `.env` 檔案：
+複製 `.env.example` 為 `.env` 並填入 API Key：
 
 ```bash
-# Google Gemini API Key
-GOOGLE_API_KEY=your_google_api_key
-GOOGLE_API_KEY_1=your_google_api_key_account_1
-GOOGLE_API_KEY_2=your_google_api_key_account_2
-
-# GitHub Models API Key (可選)
-GITHUB_MODELS_API_KEY=your_github_token
-GITHUB_MODELS_API_KEY_1=your_github_token_account_1
-GITHUB_MODELS_API_KEY_2=your_github_token_account_2
-
-# API 服務配置
-API_HOST=127.0.0.1
-API_PORT=8000
+cp .env.example .env
 ```
+
+`.env` 最小設定（Google 必填，其他選填）：
+
+```bash
+# Google Gemini — chat、embedding、multimodal、Imagen 4
+GOOGLE_API_KEY=your_google_api_key
+GOOGLE_API_URL=https://generativelanguage.googleapis.com/v1beta/openai/
+
+# GitHub Models — GPT-4o、Grok-3、DeepSeek-R1（需要 Copilot 訂閱）
+GITHUB_MODELS_API_KEY=your_github_pat
+GITHUB_MODELS_API_URL=https://models.github.ai/inference
+
+# HuggingFace — FLUX.1-schnell 圖片生成（選填）
+HUGGINGFACE_API_KEY=your_hf_token
+HUGGINGFACE_API_URL=https://api-inference.huggingface.co
+
+# Ollama — 本地模型（選填）
+OLLAMA_API_URL=http://localhost:11434/v1
+
+# 伺服器
+API_HOST=0.0.0.0
+API_PORT=8000
+
+# 安全：設 0 允許遠端存取 /auth 與 /admin（預設 1 = 僅 localhost）
+AUTH_LOCAL_ADMIN_ONLY=1
+```
+
+多帳號支援：在 key 後加 `_1`、`_2`... 可倍增配額，router 自動輪詢。
 
 ### 2. 安裝依賴
 
@@ -89,201 +66,397 @@ API_PORT=8000
 pip install -r requirements.txt
 ```
 
-### 3. 啟動後端 API
+### 3. 啟動後端
 
 ```bash
 python api.py
 ```
 
-服務將在以下地址啟動：
-- **API 服務**: http://127.0.0.1:8000
-- **API 文檔**: http://localhost:8000/docs
-- **健康檢查**: http://localhost:8000/health
+服務啟動位址：
+- **API**：`http://localhost:8000`
+- **Swagger UI**：`http://localhost:8000/docs`
+- **健康檢查**：`http://localhost:8000/health`
 
-### 4. 啟動前端 (可選)
+### 4. 啟動前端（選填）
 
 ```bash
 ./start_frontend.sh
+# → http://localhost:3000
 ```
 
-前端將在 http://localhost:3000 啟動
+### 5. Docker 部署
 
-## 文件導覽
+```bash
+docker compose up --build
+```
 
-| 文件 | 說明 |
-|---|---|
-| [SYSTEM_ARCHITECTURE.md](SYSTEM_ARCHITECTURE.md) | 系統架構、資料流、模組責任與目前實作邊界 |
-| [OPENCLAW_API_REPORT.md](OPENCLAW_API_REPORT.md) | 最新 API、物件、OpenClaw 與 MCP/tool 能力總覽 |
-| [API_USAGE_GUIDE.md](API_USAGE_GUIDE.md) | 一般 API 呼叫指南 |
-| [DIRECT_QUERY_EXAMPLES.md](DIRECT_QUERY_EXAMPLES.md) | `/v1/direct_query` 詳細範例 |
-| [DIRECT_QUERY_SUMMARY.md](DIRECT_QUERY_SUMMARY.md) | direct query 功能摘要 |
-| [FILE_UPLOAD_API.md](FILE_UPLOAD_API.md) | `/v1/file/generate_content` 使用方式 |
+---
 
-## API 端點
+## 認證系統
 
-### 核心接口
+所有 `/v1/*` 端點都需要認證。認證流程：
+
+### 第一次使用：建立帳號
+
+```bash
+# 第一個帳號自動成為 Admin
+curl -X POST http://localhost:8000/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"username": "admin", "email": "you@example.com", "password": "yourpassword"}'
+```
+
+### 登入取得 Session Token
+
+```bash
+curl -X POST http://localhost:8000/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username": "admin", "password": "yourpassword"}'
+# → {"token": "...", "expires_at": "...", "is_admin": true}
+```
+
+### 建立 API Key（Session 驗證）
+
+```bash
+# 全功能 Key（mk_ 前綴，永久有效）
+curl -X POST http://localhost:8000/auth/keys/full \
+  -H "X-Session-Token: <session_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "my-app"}'
+# → {"key": "mk_xxxx..."}  ← 只顯示一次，請妥善保存
+
+# 限定 Agent Key（ma_ 前綴，有效期 + scope 限制）
+curl -X POST http://localhost:8000/auth/keys/agent \
+  -H "X-Session-Token: <session_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "rag-bot", "scopes": ["chat", "embeddings"], "expires_hours": 24, "rpm_limit": 20}'
+```
+
+### 使用 API Key 呼叫 API
+
+```bash
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer mk_xxxx..." \
+  -H "Content-Type: application/json" \
+  -d '{"model": "auto", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+### API Key 類型
+
+| 類型 | 前綴 | 說明 |
+|---|---|---|
+| Full Key | `mk_` | 無 scope 限制、無過期。僅限 Admin 建立。 |
+| Agent Key | `ma_` | 必須指定 scope，有 TTL（預設 1h，最長 24h），有 RPM 上限。 |
+
+---
+
+## API 端點總覽
+
+### 核心 AI 端點
+
+| 端點 | 方法 | Auth | 說明 |
+|---|---|---|---|
+| `/v1/chat/completions` | POST | API Key | OpenAI Chat Completions，支援串流 SSE |
+| `/v1/completions` | POST | API Key | Legacy Completions API |
+| `/v1/embeddings` | POST | API Key | Gemini Embedding 2，RAG 相容 |
+| `/v1/images/generations` | POST | API Key | 圖片生成 (FLUX / Imagen 4) |
+| `/v1/direct_query` | POST | API Key | 直接指定 provider/model 查詢 |
+| `/v1/file/generate_content` | POST | API Key | 上傳文件並生成內容 |
+| `/v1/models` | GET | API Key | 列出可用模型與配額狀態 |
+
+### Auth 端點
+
+| 端點 | 方法 | Auth | 說明 |
+|---|---|---|---|
+| `/auth/register` | POST | 公開 | 建立帳號（第一個自動為 Admin） |
+| `/auth/login` | POST | 公開 | 登入，取得 Session Token |
+| `/auth/logout` | POST | Session | 登出 |
+| `/auth/me` | GET | Session | 查看目前帳號資訊 |
+| `/auth/keys` | GET | Session | 列出我的 API Key |
+| `/auth/keys/full` | POST | Session (Admin) | 建立全功能 Key |
+| `/auth/keys/agent` | POST | Session | 建立限定 Agent Key |
+| `/auth/keys/{id}` | DELETE | Session | 撤銷 API Key |
+| `/auth/whitelist` | GET/POST | Session | 查看/新增 IP 白名單 |
+| `/auth/whitelist/{id}` | DELETE | Session | 刪除 IP 白名單 |
+| `/auth/audit` | GET | Session | 查看 API Key 使用審計日誌 |
+| `/auth/scopes` | GET | 公開 | 查看可用 scope 清單 |
+
+### Admin 端點（Session + localhost）
 
 | 端點 | 方法 | 說明 |
-|------|------|------|
-| `/` | `GET`/`POST` | 服務資訊與端點摘要 |
-| `/health` | `GET`/`POST` | 健康檢查 |
-| `/v1/chat/completions` | POST | OpenAI Chat Completions API |
-| `/v1/completions` | POST | OpenAI Completions API (legacy) |
-| `/v1/images/generations` | POST | OpenAI Images API (HuggingFace / open-source image models) |
-| `/v1/direct_query` | POST | 直接查詢指定 provider/model |
-| `/v1/file/generate_content` | POST | 上傳圖片或文件並生成內容 |
-| `/v1/models` | GET/POST | 列出所有可用模型 |
-
-`/v1/models` 會額外回傳 `capabilities`，用來描述模型是否支援 image/document input 與特殊任務類型。
-
-### 管理接口
-
-| 端點 | 方法 | 說明 |
-|------|------|------|
-| `/admin/status` | GET | 查看配額狀態 |
+|---|---|---|
+| `/admin/status` | GET | 查看所有模型配額狀態 |
 | `/admin/logs` | GET | 讀取最新日誌 |
-| `/admin/reset_quotas` | POST | 重置所有配額 (每日) |
-| `/admin/refresh_rpm` | POST | 重置優先順序指標 |
+| `/admin/reset_quotas` | POST | 重置所有配額 |
+| `/admin/refresh_rpm` | POST | 重置 RPM 優先順序 |
+| `/admin/accounts` | GET | 列出所有帳號（Admin）|
+| `/admin/accounts/{id}/activate` | POST | 啟用帳號 |
+| `/admin/accounts/{id}/deactivate` | POST | 停用帳號 |
 
-### OpenClaw / MCP 接口
+### MCP 端點
 
 | 端點 | 方法 | 說明 |
-|------|------|------|
+|---|---|---|
 | `/mcp/sse` | GET | OpenClaw MCP SSE transport |
-| `/mcp/messages` | POST | OpenClaw MCP JSON-RPC message channel |
+| `/mcp/messages` | POST | MCP JSON-RPC message channel |
 
-## OpenClaw 支援重點
+### 公用端點
 
-### 相容能力
+| 端點 | 方法 | 說明 |
+|---|---|---|
+| `/` | GET/POST | 服務資訊與所有端點摘要 |
+| `/health` | GET/POST | 健康檢查 |
 
-- 支援 OpenAI-style `tools` 與 `tool_choice` 請求欄位
-- 可辨識 web-search-like tool 宣告並輸出 `tool_calls`
-- 支援 OpenClaw 內建 `web_search` 導向本地搜尋工具
-- 支援 post-tool round 將搜尋結果重新送回 LLM 合成答案
-- 部分搜尋回答可附加 `citations`
-- 支援 chat completions 串流與串流 tool-call 輸出
+---
 
-這一段屬於目前程式已有的整合能力，但實際效果仍受模型、搜尋結果品質與 prompt 影響。
+## Request/Response Schema
 
-### Tool-Calling 流程
+### Chat Completions — `POST /v1/chat/completions`
 
-1. 使用者訊息送到 `/v1/chat/completions`
-2. 如果宣告了 web search 工具，gateway 先判斷是否真的需要搜尋
-3. 若需要，會先規劃搜尋任務，再回 `tool_calls`
-4. client 執行工具或由 OpenClaw 走 MCP round trip
-5. 工具結果回到 `/v1/chat/completions`
-6. gateway 萃取來源、清理工具輸出，再交給模型做最終回答
-7. 若 reviewer 判定答案仍不完整，會補做 follow-up 搜尋並重寫答案；目前支援有限多輪補救
-
-註：第 3、7 步目前屬於實驗流程，並非每次都一定觸發，也不保證所有查詢都比直接回答更好。
-
-### 研究型回答流程
-
-- 適用於需要外部資料的複雜問題
-- 先由 Gemma 決定是否需要搜尋
-- 再由 Gemma 規劃多個資訊需求與 query
-- 逐項執行搜尋並整理 evidence
-- 產生第一版答案後，再由 Gemma reviewer 判斷是否仍有缺漏
-- 若有缺漏，會補查並重寫；目前採有限多輪回圈，不是無上限迭代
-
-這個流程目前主要用來改善部分需要外部資訊的問題，但仍在調校中。
-
-### 資料驅動圖片流程
-
-- 適用於 K 線圖、趨勢圖、統計圖、dashboard、infographic 等資料型圖片需求
-- 先判斷是否屬於 data-backed image request
-- 若是，先走搜尋規劃與資料蒐集
-- 將 evidence 注入 image prompt 後再交給 image model 生成
-- 回應可包含 `images`、`citations`、`research_tasks`
-
-這條路徑已接進後端，但目前仍建議視為實驗功能。
-
-## Tool API List
-
-目前 MCP server 註冊的工具如下。
-
-### `search_web`
-
-用途：搜尋即時網路資訊，供 OpenClaw / MCP client 或 chat tool-calling round 使用。
-
-輸入物件：
+**Request：**
 
 ```json
 {
-  "query": "台指期 昨日收盤",
-  "max_results": 5
+  "model": "auto",
+  "messages": [
+    {"role": "system", "content": "你是一個助手"},
+    {"role": "user", "content": "Hello"}
+  ],
+  "temperature": 0.7,
+  "max_tokens": 2048,
+  "stream": false,
+  "target_category": null,
+  "enable_memory": true,
+  "tools": [],
+  "tool_choice": "auto",
+  "attachments": [],
+  "input_files": [],
+  "input_images": [],
+  "enable_auto_image_generation": false
 }
 ```
-
-輸入欄位：
-
-| 欄位 | 類型 | 必填 | 說明 |
-|---|---|---|---|
-| `query` | string | 是 | 搜尋關鍵字 |
-| `max_results` | integer | 否 | 最多回傳結果數，預設 `5` |
-
-輸出內容：
-
-- MCP text content list
-- 每筆結果包含標題、URL、Snippet
-- 部分資料型查詢會額外附 `Detail`
-
-## 支援的主要請求物件
-
-### Chat Completion Request
-
-`/v1/chat/completions` 目前實際支援的主要欄位：
 
 | 欄位 | 類型 | 說明 |
 |---|---|---|
 | `model` | string | `auto`、分類名或具體模型名 |
 | `messages` | array | OpenAI-style message list |
-| `temperature` | number | 生成溫度 |
-| `max_tokens` | integer | 回答長度上限 |
-| `max_completion_tokens` | integer | `max_tokens` 替代欄位 |
-| `stream` | boolean | 支援 SSE 串流 |
-| `target_category` | string | 指定路由類別 |
-| `enable_memory` | boolean | 啟用或停用記憶注入 |
-| `tools` | array | OpenAI-style tool definitions |
-| `tool_choice` | string/object | 控制工具策略 |
-| `attachments` | array | top-level 附件（自動注入成 content parts） |
-| `input_files` | array | top-level 文件陣列（轉為 `input_file`） |
-| `input_images` | array | top-level 圖像陣列（轉為 `image_url`） |
-| `enable_auto_image_generation` | boolean | 對話中自動判斷是否要改走 image generation |
-| `image_model` | string | 自動生圖時使用的 image model，預設為 HuggingFace FLUX |
-| `image_n` | integer | 自動生圖張數（1-4） |
-| `image_size` | string | 自動生圖尺寸 |
+| `temperature` | float | 生成溫度（0.0–2.0），預設 0.7 |
+| `max_tokens` | integer | 最大 token 數 |
+| `stream` | boolean | 啟用 SSE token 串流 |
+| `target_category` | string | 指定路由類別（`TextOnlyHigh`/`TextOnlyLow`/`MultiModal`/...） |
+| `enable_memory` | boolean | 啟用歷史記憶注入，預設 `true` |
+| `tools` | array | OpenAI-style tool 定義 |
+| `tool_choice` | string/object | 工具選擇策略 |
+| `attachments` | array | 混合附件（text/image_url/input_file） |
+| `input_files` | array | 文件附件（PDF/CSV/XLSX/TXT） |
+| `input_images` | array | 圖片附件（base64 data URL）|
+| `enable_auto_image_generation` | boolean | 自動判斷是否改走圖片生成 |
 
-### 多模態輸入
+**Response（非串流）：**
 
-`/v1/chat/completions` 保持同一個接口，但 `messages[].content` 可以是多段內容。
+```json
+{
+  "id": "chatcmpl-abc123",
+  "object": "chat.completion",
+  "created": 1742618400,
+  "model": "openai/gpt-4o",
+  "choices": [
+    {
+      "index": 0,
+      "message": {"role": "assistant", "content": "你好！"},
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 12,
+    "completion_tokens": 8,
+    "total_tokens": 20
+  }
+}
+```
 
-目前支援的 content part：
+**Response（串流 SSE）：**
 
-- `text`
-- `input_text`
-- `image_url`
-- `input_file`
+```
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":...,"model":"openai/gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
 
-也支援直接從 request top-level 傳附件欄位（server 會自動注入到最後一則 `user` message）：
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"你"},"finish_reason":null}]}
 
-- `attachments`: 可混合 `text` / `image_url` / `input_file`
-- `input_files`: 會轉成 `input_file` parts
-- `input_images`: 會轉成 `image_url` parts
+data: [DONE]
+```
 
-目前限制：
+---
 
-- 一次最多 5 份文件
-- 已接上的文件預處理類型：`txt`、`csv`、`xlsx`、`pdf`
+### Embeddings — `POST /v1/embeddings`
 
-處理方式：
+**Request：**
 
-- 圖像會在需要時保留給多模態聊天模型
-- 文件會先做 server-side 文字抽取或摘要，再合併進 prompt
-- router 會先用較便宜的模型判斷是否真的需要切到 `MultiModal`
-- 若只是文件摘要分析，通常仍優先走較便宜的文字模型
+```json
+{
+  "model": "gemini-embedding-2-preview",
+  "input": "Hello world",
+  "encoding_format": "float"
+}
+```
 
-範例：
+`input` 可以是字串或字串陣列（批次 embedding）。
+
+**Response：**
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "object": "embedding",
+      "embedding": [0.012, -0.034, ...],
+      "index": 0
+    }
+  ],
+  "model": "gemini-embedding-2-preview",
+  "usage": {
+    "prompt_tokens": 2,
+    "total_tokens": 2
+  }
+}
+```
+
+支援的 Embedding 模型：
+
+| 模型 | 維度 | 配額 |
+|---|---|---|
+| `gemini-embedding-2-preview` | 3072 | 1000 RPD / 帳號 |
+| `gemini-embedding-001` | 3072 | 1000 RPD / 帳號 |
+
+---
+
+### Image Generation — `POST /v1/images/generations`
+
+**Request：**
+
+```json
+{
+  "model": "black-forest-labs/FLUX.1-schnell",
+  "prompt": "a futuristic city at sunset",
+  "n": 1,
+  "size": "1024x1024",
+  "response_format": "b64_json"
+}
+```
+
+**Response：**
+
+```json
+{
+  "created": 1742618400,
+  "data": [
+    {"b64_json": "iVBORw0KGgo..."}
+  ]
+}
+```
+
+支援的圖片模型：
+
+| 模型 | Provider |
+|---|---|
+| `black-forest-labs/FLUX.1-schnell` | HuggingFace |
+| `stabilityai/stable-diffusion-xl-base-1.0` | HuggingFace |
+| `imagen-4-generate` | Google |
+| `imagen-4-ultra-generate` | Google |
+| `imagen-4-fast-generate` | Google |
+
+---
+
+### Direct Query — `POST /v1/direct_query`
+
+直接指定 provider 與 model，跳過 router 路由邏輯。
+
+**Request：**
+
+```json
+{
+  "model_name": "openai/gpt-4o",
+  "provider": "GitHub",
+  "prompt": "Hello",
+  "temperature": 0.7,
+  "max_tokens": 1000
+}
+```
+
+---
+
+### 標準錯誤格式
+
+所有錯誤回應使用 OpenAI 相容格式：
+
+```json
+{
+  "error": {
+    "message": "Session token 無效或已過期，請重新登入",
+    "type": "authentication_error",
+    "code": 401,
+    "param": null
+  }
+}
+```
+
+| HTTP 狀態碼 | type |
+|---|---|
+| 400 | `invalid_request_error` |
+| 401 | `authentication_error` |
+| 403 | `permission_error` |
+| 404 | `not_found_error` |
+| 429 | `rate_limit_error` |
+| 5xx | `server_error` |
+
+---
+
+## Response Headers
+
+每個回應都包含版本 header：
+
+```
+X-API-Version: 2.0.0
+X-Powered-By: ModelRouter
+```
+
+---
+
+## 模型路由系統
+
+### 路由類別
+
+| 類別 | 模型 | 用途 |
+|---|---|---|
+| `TextOnlyHigh` | GitHub: gpt-4o, gpt-5, gpt-5-mini, o1-preview, DeepSeek-R1, Grok-3, Grok-3-mini<br>Google: gemini-2.5-flash, gemini-2.5-flash-lite, gemini-3-flash | 高品質文字生成 |
+| `TextOnlyLow` | GitHub: gpt-4o-mini<br>Google: gemma-3-12b-it, gemini-3.1-flash-lite<br>Ollama: qwen3:4b-instruct, deepseek-r1:1.5b | 輕量/本地模型 |
+| `MultiModal` | Google: gemini-2.5-flash, gemma-3-27b-it, gemini-2.5-flash-tts | 圖片/文件理解 |
+| `ChatOnly` | Ollama 本地模型 | 純文字對話，無外部依賴 |
+| `ImageGeneration` | HuggingFace: FLUX.1-schnell, SD-XL | 圖片生成 |
+| `Embedding` | Google: gemini-embedding-2-preview, gemini-embedding-001 | 向量 embedding |
+
+### `model` 欄位支援值
+
+```
+auto             → TextOnlyHigh → TextOnlyLow failover
+TextOnlyHigh     → 指定高品質類別
+TextOnlyLow      → 指定輕量類別
+MultiModal       → 指定多模態類別
+openai/gpt-4o    → 具體模型名，直接路由
+gemini-2.5-flash → 具體模型名，直接路由
+```
+
+### 配額管理
+
+- 配額以 `provider|account|model` 為 key 追蹤
+- 用完後自動 failover 到下一個 account/model
+- 多帳號設定：`GOOGLE_API_KEY`, `GOOGLE_API_KEY_1`, `GOOGLE_API_KEY_2`...
+- 可透過 `/admin/status` 查看所有配額，`/admin/reset_quotas` 重置
+
+---
+
+## 多模態輸入
+
+`/v1/chat/completions` 支援圖片與文件附件：
 
 ```json
 {
@@ -292,13 +465,16 @@ python api.py
     {
       "role": "user",
       "content": [
-        {"type": "text", "text": "請根據這些附件做摘要"},
-        {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
+        {"type": "text", "text": "請分析這份報告"},
         {
           "type": "input_file",
           "file_name": "report.pdf",
           "mime_type": "application/pdf",
-          "file_data": "base64..."
+          "file_data": "<base64>"
+        },
+        {
+          "type": "image_url",
+          "image_url": {"url": "data:image/png;base64,<base64>"}
         }
       ]
     }
@@ -306,515 +482,266 @@ python api.py
 }
 ```
 
-Top-level 附件欄位範例：
+或使用 top-level 快捷欄位：
 
 ```json
 {
   "model": "auto",
-  "messages": [
-    {
-      "role": "user",
-      "content": "請根據附件整理重點"
-    }
-  ],
+  "messages": [{"role": "user", "content": "請整理附件重點"}],
   "input_files": [
-    {
-      "file_name": "sales.csv",
-      "mime_type": "text/csv",
-      "file_data": "base64..."
-    }
+    {"file_name": "sales.csv", "mime_type": "text/csv", "file_data": "<base64>"}
   ],
-  "input_images": [
-    "data:image/png;base64,..."
-  ]
+  "input_images": ["data:image/png;base64,<base64>"]
 }
 ```
 
-多 key 行為：
+支援文件類型：`pdf`、`csv`、`xlsx`、`txt`（每次最多 5 份）
 
-- 可同時設定 `GOOGLE_API_KEY`, `GOOGLE_API_KEY_1`, `GOOGLE_API_KEY_2`...（GitHub 同規則）
-- 生圖可另外設定 `HUGGINGFACE_API_KEY`, `HUGGINGFACE_API_KEY_1`, `HUGGINGFACE_API_KEY_2`...
-- Router 會將同 provider 同 model 展開成多個 account 路由節點並輪詢
-- 配額以 `provider|account|model` 追蹤，`/v1/models` 與 `/admin/status` 會回傳彙總與各 account 明細
+---
 
-### Message Object
+## RAG / Embedding 整合
 
-支援的 message role 與正規化規則：
-
-- `user`
-- `assistant`
-- `system`
-- `developer` 會被正規化成 `system`
-- `tool` 會被轉成 system transcript 再交給 router
-
-### 內容型別
-
-`content` 可接受：
-
-- 純字串
-- OpenAI-style part list
-- 含 `text` 或 `content` 的 object
-
-## 使用範例
-
-### Python (OpenAI SDK)
+`/v1/embeddings` 相容 OpenAI Embeddings API，可直接用於 LangChain、LlamaIndex 等框架：
 
 ```python
 from openai import OpenAI
 
 client = OpenAI(
     base_url="http://localhost:8000/v1",
-    api_key="dummy"  # ModelRouter 不需要驗證，可填任意值
+    api_key="mk_xxxx..."
 )
 
-response = client.chat.completions.create(
-    model="auto",  # 自動選擇最佳模型
-    messages=[
-        {"role": "user", "content": "Hello!"}
-    ]
+# 單筆
+resp = client.embeddings.create(
+    model="gemini-embedding-2-preview",
+    input="今天天氣很好"
+)
+vector = resp.data[0].embedding  # 3072-dim float list
+
+# 批次
+resp = client.embeddings.create(
+    model="gemini-embedding-2-preview",
+    input=["文件一", "文件二", "文件三"]
+)
+```
+
+---
+
+## 智慧搜尋與記憶功能
+
+### 搜尋與研究流程（實驗性）
+
+- 判斷用戶問題是否需要搜尋
+- 規劃多個搜尋 query，逐項執行 web search
+- 整理 evidence 後生成答案
+- Reviewer 判斷是否有缺漏，必要時補查並重寫（最多 3 輪，上限 6 輪）
+- 回應可附加 `citations`、`research_tasks`
+
+### 記憶功能
+
+- Pre-chat 分析：使用 Gemma 判斷是否需要查歷史 log
+- 觸發關鍵字：記憶、剛剛、之前、上次、日誌、history、log、memory
+- 自動讀取 `app/app.log` 並增強 prompt
+- 對話歷史保留最近 10 輪
+- 可在 request 中設 `"enable_memory": false` 停用
+
+---
+
+## 使用範例
+
+### Python（OpenAI SDK）
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="mk_xxxx..."
 )
 
-print(response.choices[0].message.content)
+# 普通對話
+resp = client.chat.completions.create(
+    model="auto",
+    messages=[{"role": "user", "content": "你好！"}]
+)
+print(resp.choices[0].message.content)
+
+# 串流
+for chunk in client.chat.completions.create(
+    model="auto",
+    messages=[{"role": "user", "content": "寫一首詩"}],
+    stream=True
+):
+    print(chunk.choices[0].delta.content or "", end="", flush=True)
+
+# Embedding
+resp = client.embeddings.create(
+    model="gemini-embedding-2-preview",
+    input="Hello world"
+)
+print(resp.data[0].embedding[:5])
 ```
 
 ### cURL
 
 ```bash
+# Chat
 curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer mk_xxxx..." \
   -H "Content-Type: application/json" \
-  -d '{
-    "model": "auto",
-    "messages": [{"role": "user", "content": "Hello!"}]
-  }'
-```
+  -d '{"model":"auto","messages":[{"role":"user","content":"Hello"}]}'
 
-### 查看配額狀態
-
-```bash
-curl http://localhost:8000/admin/status
-```
-
-### 直接 API 呼叫格式
-
-您可以直接透過 HTTP POST 請求與 API 互動，無需安裝任何 SDK：
-
-#### 基本請求格式
-
-```bash
-POST http://localhost:8000/v1/chat/completions
-Content-Type: application/json
-
-{
-  "model": "auto",
-  "messages": [
-    {"role": "system", "content": "你是一個有幫助的助手"},
-    {"role": "user", "content": "你好"}
-  ]
-}
-```
-
-#### 完整參數範例
-
-```bash
-curl -X POST http://localhost:8000/v1/chat/completions \
+# Embedding
+curl -X POST http://localhost:8000/v1/embeddings \
+  -H "Authorization: Bearer mk_xxxx..." \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer dummy" \
-  -d '{
-    "model": "auto",
-    "messages": [
-      {"role": "system", "content": "你是一個專業的程式設計助手"},
-      {"role": "user", "content": "用 Python 寫一個 Hello World"}
-    ],
-    "temperature": 0.7,
-    "max_tokens": 1000,
-    "top_p": 1.0,
-    "frequency_penalty": 0.0,
-    "presence_penalty": 0.0
-  }'
+  -d '{"model":"gemini-embedding-2-preview","input":"Hello world"}'
+
+# 查配額
+curl http://localhost:8000/admin/status \
+  -H "X-Session-Token: <session_token>"
 ```
 
-#### 多輪對話範例
-
-```bash
-curl -X POST http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "TextOnlyHigh",
-    "messages": [
-      {"role": "user", "content": "什麼是機器學習？"},
-      {"role": "assistant", "content": "機器學習是人工智慧的一個分支..."},
-      {"role": "user", "content": "可以舉例說明嗎？"}
-    ]
-  }'
-```
-
-#### 使用不同程式語言直接呼叫
-
-**JavaScript/Node.js (Fetch API):**
-```javascript
-const response = await fetch('http://localhost:8000/v1/chat/completions', {
-  method: 'POST',
-  headers: {
-    'Content-Type': 'application/json',
-  },
-  body: JSON.stringify({
-    model: 'auto',
-    messages: [
-      { role: 'user', content: '你好，請介紹自己' }
-    ],
-    temperature: 0.7,
-    max_tokens: 500
-  })
-});
-
-const data = await response.json();
-console.log(data.choices[0].message.content);
-```
-
-**Python (requests):**
-```python
-import requests
-
-response = requests.post(
-    'http://localhost:8000/v1/chat/completions',
-    headers={'Content-Type': 'application/json'},
-    json={
-        'model': 'auto',
-        'messages': [
-            {'role': 'user', 'content': '用 Python 計算階乘'}
-        ],
-        'temperature': 0.7,
-        'max_tokens': 1000
-    }
-)
-
-result = response.json()
-print(result['choices'][0]['message']['content'])
-```
-
-**PHP:**
-```php
-<?php
-$data = [
-    'model' => 'auto',
-    'messages' => [
-        ['role' => 'user', 'content' => 'Hello from PHP!']
-    ]
-];
-
-$options = [
-    'http' => [
-        'method' => 'POST',
-        'header' => 'Content-Type: application/json',
-        'content' => json_encode($data)
-    ]
-];
-
-$context = stream_context_create($options);
-$response = file_get_contents('http://localhost:8000/v1/chat/completions', false, $context);
-$result = json_decode($response, true);
-
-echo $result['choices'][0]['message']['content'];
-?>
-```
-
-**Java (HttpClient):**
-```java
-import java.net.http.*;
-import java.net.URI;
-
-HttpClient client = HttpClient.newHttpClient();
-
-String json = """
-{
-  "model": "auto",
-  "messages": [{"role": "user", "content": "Hello from Java!"}]
-}
-""";
-
-HttpRequest request = HttpRequest.newBuilder()
-    .uri(URI.create("http://localhost:8000/v1/chat/completions"))
-    .header("Content-Type", "application/json")
-    .POST(HttpRequest.BodyPublishers.ofString(json))
-    .build();
-
-HttpResponse<String> response = client.send(request, 
-    HttpResponse.BodyHandlers.ofString());
-
-System.out.println(response.body());
-```
-
-#### 回應格式
-
-成功的回應格式 (OpenAI 相容):
-
-```json
-{
-  "id": "chatcmpl-abc123",
-  "object": "chat.completion",
-  "created": 1709856000,
-  "model": "gemini-2.5-flash",
-  "choices": [
-    {
-      "index": 0,
-      "message": {
-        "role": "assistant",
-        "content": "你好！我是 AI 助手，很高興為您服務。"
-      },
-      "finish_reason": "stop"
-    }
-  ],
-  "usage": {
-    "prompt_tokens": 10,
-    "completion_tokens": 15,
-    "total_tokens": 25
-  }
-}
-```
-
-錯誤回應格式:
-
-```json
-{
-  "error": {
-    "message": "所有模型都不可用或已達配額上限",
-    "type": "unavailable_error",
-    "code": 503
-  }
-}
-```
-
-#### 遠端伺服器呼叫
-
-如果 API 部署在遠端伺服器，將 `localhost` 替換為伺服器 IP 或網域名稱：
-
-```bash
-# 使用 IP 位址
-curl -X POST http://192.168.1.100:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "auto", "messages": [{"role": "user", "content": "Hello"}]}'
-
-# 使用網域名稱
-curl -X POST https://api.yourdomain.com/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "auto", "messages": [{"role": "user", "content": "Hello"}]}'
-```
-
-#### 支援的參數
-
-| 參數 | 類型 | 必填 | 說明 |
-|------|------|------|------|
-| `model` | string | 是 | 模型名稱 (`auto`, `TextOnlyHigh`, `TextOnlyLow` 或具體模型) |
-| `messages` | array | 是 | 對話訊息陣列 |
-| `temperature` | float | 否 | 控制隨機性 (0.0-2.0)，預設 1.0 |
-| `max_tokens` | integer | 否 | 最大生成 tokens 數，預設模型限制 |
-| `top_p` | float | 否 | Nucleus sampling (0.0-1.0)，預設 1.0 |
-| `frequency_penalty` | float | 否 | 頻率懲罰 (-2.0-2.0)，預設 0.0 |
-| `presence_penalty` | float | 否 | 存在懲罰 (-2.0-2.0)，預設 0.0 |
-| `stop` | string/array | 否 | 停止序列 |
-| `stream` | boolean | 否 | `/v1/chat/completions` 支援 SSE；`/v1/completions` 不支援 |
-
-## 🎯 模型選擇
-
-`model` 參數支援：
-
-- `auto` - 自動選擇（先 TextOnlyHigh，再 TextOnlyLow）
-- `TextOnlyHigh` - 只用高品質模型（GitHub gpt-4o, Gemini 2.5 flash）
-- `TextOnlyLow` - 只用經濟型模型（GitHub gpt-4o-mini, Gemini 3.1 flash-lite, Ollama 本地模型）
-- 具體模型名稱 - 如 `openai/gpt-4o`、`gemini-2.5-flash`
-
-## 🧠 智慧記憶功能 ⭐ NEW
-
-ModelRouter 現在支援智慧記憶功能，可以自動判斷是否需要查詢歷史日誌：
-
-### 功能特點
-
-- **Pre-chat 分析**：使用 gemma-3-27b-it 判斷用戶問題是否需要查詢歷史
-- **自動 RAG**：檢測到記憶相關關鍵字時，自動讀取 app.log 並增強 prompt
-- **配額追蹤**：gemma-3-27b-it 的使用會正確計入配額管理系統
-- **對話歷史**：自動保存最近 10 輪對話
-
-### 工作流程
-
-```
-用戶輸入
-    ↓
-檢查關鍵字
-    ↓
-Pre-chat 分析 (gemma-3-27b-it)
-    ├─ 檢查配額是否足夠 ⭐
-    ├─ 調用模型
-    └─ 成功後扣減配額 ⭐
-    ↓
-需要查 log？
-    ├─ 否 → 正常處理
-    └─ 是 → 讀取 app.log
-            ↓
-         增強 prompt
-            ↓
-         發送到主模型
-            ↓
-         返回結果
-            ↓
-         保存到對話歷史
-```
-
-### 觸發關鍵字
-
-當用戶問題包含以下關鍵字時，會觸發記憶查詢：
-
-**中文**：記憶、查看過去、剛剛、之前、先前、上次、日誌、歷史、記錄
-
-**英文**：memory、log、history
-
-### 使用範例
-
-```python
-# 一般對話（不觸發記憶）
-response = client.chat.completions.create(
-    model="auto",
-    messages=[{"role": "user", "content": "你好，介紹一下你自己"}]
-)
-
-# 查詢歷史（觸發記憶，會自動查詢 app.log）
-response = client.chat.completions.create(
-    model="auto",
-    messages=[{"role": "user", "content": "請查看剛剛的記錄"}]
-)
-```
-
-### 配額管理機制
-
-Pre-chat 分析採用**兩層配額管理機制**：
-
-**第一層：gemma-3-27b-it（主要）**
-- 使用 gemma-3-27b-it 模型進行智能判斷
-- 調用前檢查配額，確保配額足夠才調用
-- 調用成功後自動扣減配額（計數跳動）⭐
-- 配額設定：14400 RPD（每日請求數）
-
-**第二層：關鍵字匹配（備用）**
-- 如果 gemma-3-27b-it 配額用完，自動降級為關鍵字匹配
-- 完全本地處理，不依賴外部 API
-- 保證功能不會完全失效
-
-### 查看配額狀態
-
-```bash
-# 查看所有模型配額（包含 gemma-3-27b-it）
-curl http://localhost:8000/admin/status
-
-# 重置配額（每日一次）
-curl -X POST http://localhost:8000/admin/reset_quotas
-
-# 查看即時日誌
-tail -f app/app.log | grep -E '\[Pre-chat\]|\[Memory\]'
-```
-
-### 技術細節
-
-ModelRouter 新增的方法：
-
-- **`add_to_history(user_message, assistant_response)`** - 將對話添加到歷史記錄
-- **`check_need_log_rag(user_message)`** - Pre-chat 分析，自動管理配額
-- **`read_app_log(max_lines=100)`** - 讀取 app.log 的最後 N 行
-
-配置參數：
-- `max_history_size`: 最多保留的對話輪數（默認 10）
-- `max_lines`: 讀取 log 的最大行數（默認 100）
+---
 
 ## 專案結構
 
 ```
 llm-api/
-├── api.py                     # 主 API 服務
-├── ModelRouter/               # 路由引擎
-│   ├── ModelRouter.py         # 核心路由邏輯
-│   └── models.py              # 模型配置
-├── frontend/                  # React 前端
+├── api.py                    # 主 FastAPI 應用，所有 endpoint
+├── ModelRouter/
+│   ├── ModelRouter.py        # 核心路由引擎，chat/embed/stream 方法
+│   └── models.py             # 模型配置（類別、RPM/RPD 配額）
+├── app/
+│   ├── auth.py               # 認證：帳號、session、API key、IP 白名單
+│   ├── schemas.py            # Pydantic request/response schema
+│   ├── response.py           # 回應建構工具
+│   ├── search.py             # Web search + research 流程
+│   ├── messages.py           # Message 正規化工具
+│   ├── multimodal.py         # 圖片/文件預處理
+│   ├── tools.py              # Tool-calling 工具
+│   └── app.log               # 執行期日誌
+├── frontend/                 # React 前端
 │   ├── src/
-│   │   ├── components/        # UI 組件
-│   │   └── App.jsx            # 主應用
+│   │   ├── components/       # Dashboard、Chat、Auth 等 UI 組件
+│   │   └── App.jsx
 │   └── package.json
-├── .env                       # 環境變數配置
-├── start_frontend.sh          # 前端啟動腳本
-└── README.md                  # 本文件
+├── Dockerfile                # Docker 映像
+├── docker-compose.yml        # Docker Compose 部署
+├── .env.example              # 環境變數範本
+├── requirements.txt          # Python 依賴
+├── auth.db                   # SQLite 認證資料庫（自動建立）
+├── usage_tracker.json        # 配額追蹤（自動建立）
+└── start_frontend.sh         # 前端啟動腳本
 ```
 
-## 配置說明
+---
 
-### 環境變數
-
-在 `.env` 中配置：
+## Docker 部署
 
 ```bash
-# Google Gemini API
-GOOGLE_API_KEY=your_google_api_key
-GOOGLE_API_URL=https://generativelanguage.googleapis.com/v1beta/openai/
+# 建立並啟動
+docker compose up --build
 
-# 同一組 Google key 目前也用於多模態 chat / OCR 類請求
+# 背景執行
+docker compose up -d
 
-# GitHub Models (可選)
-GITHUB_MODELS_API_KEY=your_github_personal_access_token
-GITHUB_MODELS_API_URL=https://models.github.ai/inference
-
-# Ollama (本地，可選)
-OLLAMA_API_KEY=ollama
-OLLAMA_API_URL=http://localhost:11434/v1
-
-# API 服務
-API_HOST=0.0.0.0
-API_PORT=8000
+# 查看日誌
+docker compose logs -f
 ```
 
-### 模型優先順序
+`docker-compose.yml` 會自動掛載 `auth.db`、`usage_tracker.json`、`app/app.log` 到容器外部，資料不會在重啟時遺失。
 
-在 `ModelRouter/ModelRouter.py` 的 `_config_limits` 中配置：
+---
 
-- **TextOnlyHigh**: GitHub gpt-4o → Google gemini-2.5-flash
-- **TextOnlyLow**: GitHub gpt-4o-mini → Google gemini-3.1-flash-lite → Ollama 本地模型
+## 環境變數說明
 
-順序決定 failover 策略，額度滿或失敗會自動切換下一個。
+| 變數 | 說明 |
+|---|---|
+| `GOOGLE_API_KEY` | Google Gemini API Key（chat + embedding + Imagen 4） |
+| `GOOGLE_API_URL` | Google API URL（預設 `generativelanguage.googleapis.com/v1beta/openai/`） |
+| `GITHUB_MODELS_API_KEY` | GitHub PAT，需有 Copilot 訂閱 |
+| `GITHUB_MODELS_API_URL` | GitHub Models URL（預設 `models.github.ai/inference`） |
+| `HUGGINGFACE_API_KEY` | HuggingFace Token，用於 FLUX 圖片生成 |
+| `OLLAMA_API_URL` | Ollama URL（預設 `http://localhost:11434/v1`） |
+| `API_HOST` | 服務綁定地址（預設 `0.0.0.0`） |
+| `API_PORT` | 服務端口（預設 `8000`） |
+| `AUTH_LOCAL_ADMIN_ONLY` | `1` = `/auth` 與 `/admin` 僅限 localhost，`0` = 允許遠端 |
+| `AUTH_DEFAULT_LOCALHOST_ONLY` | `1` = API Key 無白名單時僅允許 localhost |
+| `AUTH_AGENT_MAX_HOURS` | Agent Key 最長有效期（預設 `24` 小時） |
+| `AUTH_AGENT_MAX_RPM` | Agent Key 最大 RPM（預設 `20`） |
+
+---
 
 ## 常見問題
 
-### 1. GitHub Models 403 錯誤
+### 無法登入 / 忘記密碼
 
-- 確認 `GITHUB_MODELS_API_KEY` 已設定（需要 GitHub PAT Token）
-- 確認你的 GitHub 帳號有 Copilot 訂閱
-- 部分模型需要 Copilot Pro/Enterprise
-
-暫時解決：系統會自動 failover 到 Google Gemini
-
-### 2. Google Gemini API Key
-
-前往 https://aistudio.google.com/app/apikey 建立 API Key
-
-### 3. 如何使用本地 Ollama 模型
+找回帳號名稱：
 
 ```bash
-# 1. 安裝 Ollama
-curl -fsSL https://ollama.com/install.sh | sh
+python3 -c "
+import sqlite3; conn = sqlite3.connect('auth.db')
+rows = conn.execute('SELECT id, username, email, is_admin FROM accounts').fetchall()
+print(rows)
+"
+```
 
-# 2. 下載模型
+### GitHub Models 403 錯誤
+
+- 確認 PAT 有效且帳號有 Copilot 訂閱
+- 部分模型（gpt-5、o1）需要 Copilot Pro/Enterprise
+- 系統會自動 failover 到 Google Gemini
+
+### 取得 Google Gemini API Key
+
+前往 [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey) 建立
+
+### 使用 Ollama 本地模型
+
+```bash
 ollama pull qwen3:4b-instruct
-ollama pull deepseek-r1:1.5b
-
-# 3. 確保 Ollama 在背景運行
 ollama serve
 ```
 
-ModelRouter 會在高優先級模型額度用完後自動切換到 Ollama。
+ModelRouter 會在高優先級模型額度用完後自動切換 Ollama。
 
-## Web UI 功能
+### Embedding 模型不可用
 
-前端提供：
-- 💬 **對話介面** - 即時與 AI 對話
-- 📊 **配額儀錶板** - 查看各模型使用情況
-- ⚙️ **設定調整** - Temperature、Max Tokens、模型選擇
-- 🔄 **自動刷新** - 每 5 分鐘更新配額
+確認 `text-embedding-004` 已於 2026-01-14 下線，請改用 `gemini-embedding-2-preview` 或 `gemini-embedding-001`。
 
-詳細說明請參考 [FRONTEND_GUIDE.md](FRONTEND_GUIDE.md)
+---
+
+## 文件索引
+
+| 文件 | 說明 |
+|---|---|
+| [API_USAGE_GUIDE.md](API_USAGE_GUIDE.md) | API 呼叫詳細指南 |
+| [SYSTEM_ARCHITECTURE.md](SYSTEM_ARCHITECTURE.md) | 系統架構與資料流 |
+| [OPENCLAW_API_REPORT.md](OPENCLAW_API_REPORT.md) | OpenClaw / MCP 能力總覽 |
+| [DIRECT_QUERY_EXAMPLES.md](DIRECT_QUERY_EXAMPLES.md) | `/v1/direct_query` 範例 |
+| [FILE_UPLOAD_API.md](FILE_UPLOAD_API.md) | 文件上傳使用方式 |
+
+---
+
+## 📸 功能展示
+
+### 對話介面
+![對話介面](demo-png/demo-chat.PNG)
+
+### 配額儀錶板
+![配額儀錶板](demo-png/demo-dash.PNG)
+
+### AI 回應
+![AI 回應](demo-png/demo-answer.PNG)
+
+### 智慧切換
+![智慧切換](demo-png/demo-switch.PNG)
+
+### 日誌檢視器
+![日誌檢視器](demo-png/demo-log.PNG)
+
+---
 
 ## 授權
 
